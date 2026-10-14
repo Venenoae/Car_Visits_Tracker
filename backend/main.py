@@ -223,13 +223,31 @@ async def process_capture_background(
             finally:
                 db_unverified.close()
 
-        # In testing mode / difficult camera angle: if vehicle detected on Entry, log as provisional visit
+        # If vehicle detected on Entry but plate was unreadable/obscured:
         elif direction == "Entry" and ai_results.get("vehicle_detected"):
-            prov_plate = f"CAR-{timestamp_str[-6:]}"
+            # Check if any vehicle entered this gate within the last 40 seconds (avoid duplicate unreadable visit for same car)
+            from database import SessionLocal, Vehicle, Visit
+            db_check = SessionLocal()
+            try:
+                current_chk = datetime.utcnow()
+                recent_gate_visit = db_check.query(Visit).filter(
+                    Visit.zone == zone,
+                    Visit.status == "Inside"
+                ).order_by(Visit.id.desc()).first()
+
+                if recent_gate_visit:
+                    diff_sec = (current_chk - recent_gate_visit.entry_timestamp).total_seconds()
+                    if diff_sec < 40:
+                        print(f"[AI Debounce] Vehicle {recent_gate_visit.plate_number} still in gate ({diff_sec:.1f}s ago). Ignoring duplicate unreadable snapshot.")
+                        return
+            finally:
+                db_check.close()
+
+            prov_plate = f"UNREADABLE-{timestamp_str[-6:]}"
             plate = prov_plate
             color = ai_results.get("color", "Unknown")
             brand = ai_results.get("brand", "Unknown")
-            print(f"[Testing Mode] 🚗 Vehicle entered with unreadable plate. Creating visit '{plate}' ({color}).")
+            print(f"[AI Review] 🚗 Unidentified vehicle entered gate. Created '{plate}' ({color}, {brand}). Manual review available.")
         else:
             detail_msg = ai_results.get("message", "No vehicle or plate detected in gate area")
             if ai_results.get("plate") == "UNKNOWN":
@@ -250,7 +268,7 @@ async def process_capture_background(
     from database import SessionLocal, Vehicle, Visit
     db = SessionLocal()
     try:
-        # Create or Fetch Vehicle
+        # Create or Fetch Vehicle with Fleet Registry Master Lookup
         vehicle = db.query(Vehicle).filter(Vehicle.plate_number == plate).first()
         if not vehicle:
             vehicle = Vehicle(
@@ -260,33 +278,44 @@ async def process_capture_background(
             )
             db.add(vehicle)
             db.flush()
+        else:
+            # Fleet Registry Lookup: Master database record takes priority over vision estimates
+            if vehicle.brand and vehicle.brand != "Unknown":
+                brand = vehicle.brand
+            elif brand and brand != "Unknown":
+                vehicle.brand = brand
+
+            if vehicle.color and vehicle.color != "Unknown":
+                color = vehicle.color
+            elif color and color != "Unknown":
+                vehicle.color = color
 
         current_time = datetime.utcnow()
         visit = None
 
         if direction == "Entry":
-            # 1. If this is a real recognized plate, check if we created a provisional visit (CAR-xxxx) in the last 35s
-            if not plate.startswith("CAR-"):
+            # 1. If this is a real recognized plate, check if we created an unreadable/provisional visit in the last 45s
+            if not plate.startswith("UNREADABLE-") and not plate.startswith("CAR-"):
                 recent_provisional = db.query(Visit).filter(
                     Visit.zone == zone,
                     Visit.status == "Inside",
-                    Visit.plate_number.like("CAR-%")
+                    (Visit.plate_number.like("UNREADABLE-%") | Visit.plate_number.like("CAR-%"))
                 ).order_by(Visit.id.desc()).first()
 
                 if recent_provisional:
                     time_diff = (current_time - recent_provisional.entry_timestamp).total_seconds()
-                    if time_diff < 35:
-                        print(f"[AI Upgrade] Upgrading provisional visit '{recent_provisional.plate_number}' to recognized plate '{plate}'!")
+                    if time_diff < 45:
+                        print(f"[AI Upgrade] Upgrading unreadable visit '{recent_provisional.plate_number}' to recognized plate '{plate}'!")
                         recent_provisional.plate_number = plate
                         recent_provisional.entry_image_url = relative_img_url
                         visit = recent_provisional
 
-            # 2. If this is a provisional plate, check if an existing provisional visit was created in the last 30s
-            elif plate.startswith("CAR-"):
+            # 2. If this is an unreadable plate, check if an existing unreadable visit was created in the last 30s
+            elif plate.startswith("UNREADABLE-") or plate.startswith("CAR-"):
                 recent_provisional = db.query(Visit).filter(
                     Visit.zone == zone,
                     Visit.status == "Inside",
-                    Visit.plate_number.like("CAR-%")
+                    (Visit.plate_number.like("UNREADABLE-%") | Visit.plate_number.like("CAR-%"))
                 ).order_by(Visit.id.desc()).first()
 
                 if recent_provisional:

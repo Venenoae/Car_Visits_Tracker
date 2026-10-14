@@ -178,71 +178,119 @@ def extract_license_plate(vehicle_img) -> str:
 
 
 
+KNOWN_BRANDS = [
+    "PORSCHE", "MERCEDES-BENZ", "MERCEDES", "BMW", "AUDI", "LEXUS", 
+    "TOYOTA", "NISSAN", "LAND ROVER", "RANGE ROVER", "FERRARI", 
+    "LAMBORGHINI", "BENTLEY", "ROLLS ROYCE", "ASTON MARTIN", "MCLAREN",
+    "JEEP", "FORD", "CHEVROLET", "CADILLAC", "GMC", "HYUNDAI", "KIA", 
+    "TESLA", "VOLKSWAGEN", "MITSUBISHI", "HONDA", "MAZDA", "SUBARU", 
+    "SUZUKI", "INFINITI", "JAGUAR", "DODGE", "RAM", "MASERATI", 
+    "GENESIS", "BYD", "GEELY", "MG", "HAVAL", "CHERY", "JETOUR"
+]
+
 def classify_color(vehicle_img) -> str:
     """
-    Robust HSV-based color detection algorithm.
-    Extracts the dominant body color of the vehicle, filtering out wheels and floor reflections.
+    Paint-focused automotive color classification.
+    Samples the middle body panel (25%-75% height, 15%-85% width) to avoid
+    the dark windshield/roof tint above and the black tires/asphalt below.
+    Classifies into the Standard Automotive Palette:
+    White, Black, Silver/Grey, Blue, Red, Brown/Gold, Green, Yellow
     """
     if vehicle_img is None or vehicle_img.size == 0:
         return "Unknown"
 
-    img_resized = cv2.resize(vehicle_img, (120, 120))
-    h, w, _ = img_resized.shape
-    center_crop = img_resized[int(h * 0.15):int(h * 0.70), int(w * 0.15):int(w * 0.85)]
+    vh, vw = vehicle_img.shape[:2]
+    # Sample middle body paint
+    y_start, y_end = int(vh * 0.25), int(vh * 0.75)
+    x_start, x_end = int(vw * 0.15), int(vw * 0.85)
 
-    hsv = cv2.cvtColor(center_crop, cv2.COLOR_BGR2HSV)
+    if y_end <= y_start or x_end <= x_start:
+        body_crop = vehicle_img
+    else:
+        body_crop = vehicle_img[y_start:y_end, x_start:x_end]
+
+    img_resized = cv2.resize(body_crop, (100, 100))
+    hsv = cv2.cvtColor(img_resized, cv2.COLOR_BGR2HSV)
     pixels = hsv.reshape(-1, 3)
 
     color_counts = {
-        "White": 0, "Black": 0, "Grey/Silver": 0,
-        "Red": 0, "Orange": 0, "Yellow": 0,
-        "Green": 0, "Blue": 0, "Purple/Violet": 0
+        "White": 0, "Black": 0, "Silver/Grey": 0,
+        "Red": 0, "Blue": 0, "Brown/Gold": 0,
+        "Green": 0, "Yellow": 0
     }
 
     for h_val, s, v in pixels:
-        if s < 50:  # Low saturation: Black / Grey / White
-            if v > 180:
+        # Exclude extreme specular glare and pitch-black underbody shadow crevices
+        if v < 30 or (v > 245 and s < 15):
+            continue
+
+        if s < 45:  # Low saturation: Black / Silver/Grey / White
+            if v > 165:
                 color_counts["White"] += 1
-            elif v < 70:
+            elif v < 65:
                 color_counts["Black"] += 1
             else:
-                color_counts["Grey/Silver"] += 1
-        else:
+                color_counts["Silver/Grey"] += 1
+        else:  # Saturated colors
             if (0 <= h_val < 10) or (160 <= h_val <= 180):
                 color_counts["Red"] += 1
-            elif 10 <= h_val < 25:
-                color_counts["Orange"] += 1
-            elif 25 <= h_val < 38:
-                color_counts["Yellow"] += 1
+            elif 10 <= h_val < 22:
+                if v < 110:
+                    color_counts["Brown/Gold"] += 1
+                else:
+                    color_counts["Yellow"] += 1
+            elif 22 <= h_val < 38:
+                if v < 110:
+                    color_counts["Brown/Gold"] += 1
+                else:
+                    color_counts["Yellow"] += 1
             elif 38 <= h_val < 85:
                 color_counts["Green"] += 1
-            elif 85 <= h_val < 130:
+            elif 85 <= h_val < 135:
                 color_counts["Blue"] += 1
-            elif 130 <= h_val < 160:
-                color_counts["Purple/Violet"] += 1
+            elif 135 <= h_val < 160:
+                color_counts["Red"] += 1
 
     sorted_colors = sorted(color_counts.items(), key=lambda x: x[1], reverse=True)
-    return sorted_colors[0][0]
+    if sorted_colors and sorted_colors[0][1] > 0:
+        return sorted_colors[0][0]
+    return "Unknown"
 
 
-def classify_brand(vehicle_img) -> str:
-    """Default vehicle brand placeholder, editable in UI"""
-    return "Toyota"
+def classify_brand(vehicle_img, raw_text_tokens=None) -> str:
+    """
+    Classifies vehicle brand by searching OCR tokens for recognized brand emblems/badges.
+    Returns 'Unknown' if no emblem text is detected, allowing fleet lookup or manual edit.
+    """
+    if raw_text_tokens:
+        for token in raw_text_tokens:
+            clean_tok = re.sub(r'[^A-Z]', '', token.upper())
+            for brand in KNOWN_BRANDS:
+                brand_clean = re.sub(r'[^A-Z]', '', brand)
+                if brand_clean == clean_tok or (len(brand_clean) >= 5 and brand_clean in clean_tok):
+                    return brand.title()
+
+    return "Unknown"
 
 
 def run_ai_pipeline(image_path: str):
     """
-    Full AI pipeline:
-    1. Detect all candidate vehicles and pedestrians via YOLOv8.
-    2. Try plate recognition on vehicle candidates (prioritizing vehicles with valid plates).
-    3. If no plate found and foreground pedestrian detected, suppress as pedestrian motion.
-    4. If vehicle found with plate, classify color & brand and return visit data.
+    Strict Vehicle AI Pipeline:
+    1. Detect candidate vehicles using YOLOv8 with strict qualification:
+       - Confidence >= 0.35
+       - Bounding box >= 120x100 px
+       - Strictly Vehicle classes: car (2), motorcycle (3), bus (5), truck (7)
+       - Strictly ignores pedestrians, bicycles, animals, bags, skateboards, and reflections.
+    2. Runs multi-pass OCR on candidate vehicle crops.
+    3. If valid plate found: classifies body paint color and checks emblem text.
+    4. If vehicle verified in gate but plate obscured: returns vehicle_detected=True with plate='UNKNOWN'.
     """
     init_models()
     img = cv2.imread(image_path)
     if img is None:
         return {
             "success": False,
+            "vehicle_detected": False,
             "plate": "UNKNOWN",
             "color": "Unknown",
             "brand": "Unknown",
@@ -250,7 +298,7 @@ def run_ai_pipeline(image_path: str):
             "message": "Failed to read image"
         }
 
-    results = yolo_model(img, verbose=False, conf=0.18)
+    results = yolo_model(img, verbose=False, conf=0.25)
     h, w, _ = img.shape
 
     candidate_vehicles = []
@@ -269,10 +317,35 @@ def run_ai_pipeline(image_path: str):
             if cls_id == 0 and y2 > 350:
                 has_foreground_person = True
 
-            # Vehicle classes: car (2), motorcycle (3), bus (5), truck (7)
-            if cls_id in [2, 3, 5, 7]:
+            # Strict Vehicle Qualification:
+            # Classes: car (2), motorcycle (3), bus (5), truck (7)
+            # Minimum confidence 0.35 and minimum dimensions 120x100
+            if cls_id in [2, 3, 5, 7] and conf >= 0.35 and bw >= 120 and bh >= 100:
                 score = conf * (area ** 0.5)
                 candidate_vehicles.append((score, area, [x1, y1, x2, y2]))
+
+    # If NO vehicle met the strict qualification criteria, ignore the capture entirely
+    if not candidate_vehicles:
+        if has_foreground_person:
+            print("[AI] 🚶 Pedestrian motion detected at gate. Ignored.")
+            return {
+                "success": False,
+                "vehicle_detected": False,
+                "plate": "UNKNOWN",
+                "color": "Unknown",
+                "brand": "Unknown",
+                "coords": [0, 0, 0, 0],
+                "message": "Pedestrian motion at gate (ignored)"
+            }
+        return {
+            "success": False,
+            "vehicle_detected": False,
+            "plate": "UNKNOWN",
+            "color": "Unknown",
+            "brand": "Unknown",
+            "coords": [0, 0, 0, 0],
+            "message": "No valid vehicle detected in gate area (non-vehicle object ignored)"
+        }
 
     # Sort candidate vehicles by score (size and confidence)
     candidate_vehicles.sort(key=lambda x: x[0], reverse=True)
@@ -280,8 +353,9 @@ def run_ai_pipeline(image_path: str):
     best_plate = "UNKNOWN"
     selected_crop = None
     selected_box = None
+    detected_tokens = []
 
-    # Test OCR across candidate vehicles
+    # Test OCR across qualified candidate vehicles
     for score, area, box in candidate_vehicles:
         x1, y1, x2, y2 = box
         # Add 5% padding around crop
@@ -303,7 +377,7 @@ def run_ai_pipeline(image_path: str):
     # If a valid plate was found on any candidate vehicle, we have our match!
     if best_plate != "UNKNOWN" and selected_crop is not None:
         color = classify_color(selected_crop)
-        brand = classify_brand(selected_crop)
+        brand = classify_brand(selected_crop, detected_tokens)
         print(f"[AI] ✅ Vehicle recognized! Plate: {best_plate}, Color: {color}, Brand: {brand}")
         return {
             "success": True,
@@ -314,43 +388,20 @@ def run_ai_pipeline(image_path: str):
             "coords": [int(c) for c in selected_box]
         }
 
-    # If a vehicle was detected in the gate area, prioritize it over any pedestrians
-    if candidate_vehicles and candidate_vehicles[0][1] >= 6000:
-        box = candidate_vehicles[0][2]
-        x1, y1, x2, y2 = box
-        crop = img[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
-        color = classify_color(crop)
-        brand = classify_brand(crop)
-        print("[AI] ⚠️ Vehicle detected in gate, but license plate is unreadable/obscured.")
-        return {
-            "success": False,
-            "vehicle_detected": True,
-            "plate": "UNKNOWN",
-            "color": color,
-            "brand": brand,
-            "coords": [int(c) for c in box],
-            "message": "Vehicle detected in gate, but license plate is unreadable or obscured."
-        }
-
-    # If no vehicle was present, check if this was purely pedestrian motion
-    if has_foreground_person:
-        print("[AI] 🚶 Pedestrian motion detected at gate. Ignored.")
-        return {
-            "success": False,
-            "vehicle_detected": False,
-            "plate": "UNKNOWN",
-            "color": "Unknown",
-            "brand": "Unknown",
-            "coords": [0, 0, 0, 0],
-            "message": "Pedestrian motion detected at gate (ignored)"
-        }
-
+    # If vehicle was detected in gate, but license plate is obscured/unreadable
+    top_score, top_area, top_box = candidate_vehicles[0]
+    x1, y1, x2, y2 = top_box
+    crop = img[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+    color = classify_color(crop)
+    brand = classify_brand(crop)
+    print(f"[AI] ⚠️ Vehicle detected in gate, but license plate is unreadable/obscured ({color}).")
     return {
         "success": False,
-        "vehicle_detected": False,
+        "vehicle_detected": True,
         "plate": "UNKNOWN",
-        "color": "Unknown",
-        "brand": "Unknown",
-        "coords": [0, 0, 0, 0],
-        "message": "No vehicle detected in gate area"
+        "color": color,
+        "brand": brand,
+        "coords": [int(c) for c in top_box],
+        "message": "Vehicle detected in gate, but license plate is unreadable or obscured."
     }
+
