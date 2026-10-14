@@ -33,51 +33,81 @@ def init_models():
             ocr_reader = easyocr.Reader(['en'], gpu=False)
 
 
+NUMERIC_TRANSLATION = str.maketrans({
+    'O': '0', 'o': '0', 'Q': '0', 'D': '0',
+    'I': '1', 'i': '1', 'l': '1', '|': '1', '!': '1',
+    'Z': '2', 'z': '2',
+    'S': '5', 's': '5',
+    'G': '6', 'b': '6',
+    'B': '8',
+})
+
+def disambiguate_digits(text: str) -> str:
+    """Translates common OCR letter confusions in numeric plate sections into digits."""
+    return text.translate(NUMERIC_TRANSLATION)
+
+
 def clean_plate_candidate(raw_text: str):
     """
-    Cleans raw OCR text into a standard license plate format.
-    Handles UAE/GCC plates:
-    - Abu Dhabi badge: '15 51913' -> '51913'
-    - Dubai: 'M 11770' -> 'M 11770'
-    - Plain digits: '51913', '24384'
+    Cleans raw OCR text into standard UAE / GCC license plate formats:
+    - Dubai: [Letter] [Digits] e.g. 'M 11770', 'C 90371', 'AA 1234'
+    - Abu Dhabi: [Category] [Digits] e.g. '15 51913' -> '51913'
+    - Sharjah / Northern Emirates: [1-4 / Letter] [Digits]
+    - Plain Digits: 3 to 6 digits (e.g. '51913', '24384', '88874')
     """
     cleaned = re.sub(r'[^A-Z0-9\s]', '', raw_text.upper()).strip()
     words = [w for w in cleaned.split() if w not in IGNORED_WORDS and len(w) >= 1]
     cleaned = " ".join(words)
 
-    # 1. Abu Dhabi category prefix + 4-6 digits: '15 51913' -> '51913'
-    match_ad = re.search(r'\b(?:1|2|3|4|5|6|7|8|9|10|11|12|14|15|16|17|50)\s+(\d{3,6})\b', cleaned)
-    if match_ad:
-        digits = match_ad.group(1)
-        return digits, len(digits)
-
-    # 2. Dubai letter prefix + digits: 'M 11770' or 'AA 1234'
-    match_dubai = re.search(r'\b([A-Z]{1,2})\s*(\d{3,6})\b', cleaned)
+    # 1. Dubai Format: 1 or 2 letter code + 1 to 5 digits (e.g. 'M 11770', 'AA 1234', 'C 90371')
+    match_dubai = re.search(r'\b([A-Z]{1,2})\s*([0-9OIl!SBZG]{1,5})\b', cleaned)
     if match_dubai:
-        return f"{match_dubai.group(1)} {match_dubai.group(2)}", len(match_dubai.group(2))
+        letter_code = match_dubai.group(1)
+        raw_num = match_dubai.group(2)
+        digits = disambiguate_digits(raw_num)
+        if digits.isdigit() and 1 <= len(digits) <= 5:
+            return f"{letter_code} {digits}", len(digits)
 
-    # 3. Plain digits: 3 to 6 digits
-    match_digits = re.search(r'\b(\d{3,6})\b', cleaned)
-    if match_digits:
-        digits = match_digits.group(1)
-        return digits, len(digits)
+    # 2. Abu Dhabi Category Format: Category prefix + 3-6 digits (e.g. '15 51913' or '50 12345')
+    match_ad = re.search(r'\b(?:1|2|3|4|5|6|7|8|9|10|11|12|14|15|16|17|50)\s+([0-9OIl!SBZG]{3,6})\b', cleaned)
+    if match_ad:
+        digits = disambiguate_digits(match_ad.group(1))
+        if digits.isdigit():
+            return digits, len(digits)
 
-    # 4. General alphanumeric fallback: MUST contain at least 3 digits to qualify as a valid GCC license plate
+    # 3. Plain Numeric Plates: 3 to 6 digits (e.g. '51913', '24384', '88874')
+    tokens = cleaned.split()
+    for tok in tokens:
+        if 3 <= len(tok) <= 6:
+            converted = disambiguate_digits(tok)
+            if converted.isdigit() and sum(c.isdigit() for c in tok) >= 2:
+                return converted, len(converted)
+
+    # 4. General Alphanumeric Fallback (3 to 8 characters with at least 3 digits)
     compact = re.sub(r'\s+', '', cleaned)
-    digit_count = sum(c.isdigit() for c in compact)
-    if 3 <= len(compact) <= 8 and digit_count >= 3:
-        return compact, len(compact)
+    if 3 <= len(compact) <= 8:
+        m = re.match(r'^([A-Z]{1,2})([0-9OIl!SBZG]{3,5})$', compact)
+        if m:
+            code = m.group(1)
+            digits = disambiguate_digits(m.group(2))
+            if digits.isdigit():
+                return f"{code} {digits}", len(digits)
+        
+        digit_count = sum(c.isdigit() for c in compact)
+        if digit_count >= 3:
+            return compact, len(compact)
 
     return None, 0
 
 
 def extract_license_plate(vehicle_img) -> str:
     """
-    Multi-pass OCR reader:
+    Multi-pass OCR reader with glare reduction:
     Pass 1: Raw vehicle crop
-    Pass 2: Lower 60% bumper crop upscaled 2.5x with CLAHE (clipLimit=3.0)
-    Pass 3: Bumper crop with Otsu binarization
-    Pass 4: Bumper crop with high-contrast CLAHE (clipLimit=4.5)
+    Pass 2: Lower bumper upscaled 2.5x with standard CLAHE
+    Pass 3: Bilateral Filter + CLAHE (smooths glass reflections/headlight glare while keeping digits crisp)
+    Pass 4: Otsu binarization
+    Pass 5: High-contrast CLAHE (clipLimit=4.5) for shadowed plates
     """
     init_models()
     if vehicle_img is None or vehicle_img.size == 0:
@@ -93,7 +123,7 @@ def extract_license_plate(vehicle_img) -> str:
             score = conf + (digit_count * 0.15)
             candidates.append((plate_str, score))
 
-    # Passes 2-4: Focused bumper region
+    # Passes 2-5: Focused bumper region
     vh, vw = vehicle_img.shape[:2]
     if vh >= 40 and vw >= 60:
         bumper_crop = vehicle_img[int(vh * 0.35):vh, :]
@@ -110,7 +140,18 @@ def extract_license_plate(vehicle_img) -> str:
                 score = conf + (digit_count * 0.20) + 0.15
                 candidates.append((plate_str, score))
 
-        # Pass 3: Otsu Adaptive Binarization (great for bright reflections and glare)
+        # Pass 3: Bilateral Filter + CLAHE (glare & reflection reduction)
+        denoised = cv2.bilateralFilter(gray, 9, 75, 75)
+        clahe_bi = cv2.createCLAHE(clipLimit=3.5, tileGridSize=(8, 8))
+        enh_bi = clahe_bi.apply(denoised)
+        results_bi = ocr_reader.readtext(enh_bi)
+        for (bbox, text, conf) in results_bi:
+            plate_str, digit_count = clean_plate_candidate(text)
+            if plate_str and conf > 0.15:
+                score = conf + (digit_count * 0.20) + 0.18
+                candidates.append((plate_str, score))
+
+        # Pass 4: Otsu Adaptive Binarization
         _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         results_otsu = ocr_reader.readtext(otsu)
         for (bbox, text, conf) in results_otsu:
@@ -119,7 +160,7 @@ def extract_license_plate(vehicle_img) -> str:
                 score = conf + (digit_count * 0.20) + 0.10
                 candidates.append((plate_str, score))
 
-        # Pass 4: High-contrast CLAHE (clipLimit=4.5) for dark/shadowed plates
+        # Pass 5: High-contrast CLAHE (clipLimit=4.5) for dark/shadowed plates
         clahe_high = cv2.createCLAHE(clipLimit=4.5, tileGridSize=(8, 8))
         enh_high = clahe_high.apply(gray)
         results_high = ocr_reader.readtext(enh_high)
@@ -134,6 +175,7 @@ def extract_license_plate(vehicle_img) -> str:
         return candidates[0][0]
 
     return "UNKNOWN"
+
 
 
 def classify_color(vehicle_img) -> str:
