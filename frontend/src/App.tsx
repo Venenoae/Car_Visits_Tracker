@@ -5,10 +5,11 @@ import {
 } from 'lucide-react';
 import CameraSettings from './CameraSettings';
 
-// API Configuration
-const API_BASE = 'http://127.0.0.1:8000/api';
-const WS_URL = 'ws://127.0.0.1:8000/ws';
-const STATIC_BASE = 'http://127.0.0.1:8000';
+// Dynamic API Configuration (Automatically adapts to localhost, LAN IP 192.168.x.x for phones/tablets, or domain)
+const BACKEND_HOST = typeof window !== 'undefined' ? window.location.hostname : '127.0.0.1';
+const API_BASE = `http://${BACKEND_HOST}:8000/api`;
+const WS_URL = `ws://${BACKEND_HOST}:8000/ws`;
+const STATIC_BASE = `http://${BACKEND_HOST}:8000`;
 
 interface Visit {
   id: number;

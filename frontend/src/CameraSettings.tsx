@@ -18,6 +18,9 @@ interface StorageStats {
   cutoff_date: string;
 }
 
+const BACKEND_HOST = typeof window !== 'undefined' ? window.location.hostname : '127.0.0.1';
+const API_BASE = `http://${BACKEND_HOST}:8000/api`;
+
 const STORAGE_KEY = 'camera_settings';
 const DEFAULT_CAMERAS: CameraConfig[] = [
   { id: 'cam-zone-a', name: 'Gate Camera', zone: 'Zone A', host: '192.168.0.240', port: 8080 },
@@ -55,7 +58,7 @@ export default function CameraSettings({ onBack }: { onBack: () => void }) {
   const fetchStorageStats = async () => {
     const token = localStorage.getItem('token');
     try {
-      const res = await fetch('http://127.0.0.1:8000/api/maintenance/storage-stats', {
+      const res = await fetch(`${API_BASE}/maintenance/storage-stats`, {
         headers: token ? { Authorization: `Bearer ${token}` } : {},
       });
       if (res.ok) {
@@ -76,7 +79,7 @@ export default function CameraSettings({ onBack }: { onBack: () => void }) {
     setIsCleaning(true);
     setCleanMsg(null);
     try {
-      const res = await fetch('http://127.0.0.1:8000/api/maintenance/cleanup-images', {
+      const res = await fetch(`${API_BASE}/maintenance/cleanup-images`, {
         method: 'POST',
         headers: token ? { Authorization: `Bearer ${token}` } : {},
       });
@@ -91,6 +94,7 @@ export default function CameraSettings({ onBack }: { onBack: () => void }) {
       setIsCleaning(false);
     }
   };
+
 
   const selected = cameras.find(c => c.id === selectedId) ?? cameras[0];
 
