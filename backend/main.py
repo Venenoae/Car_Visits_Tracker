@@ -708,6 +708,8 @@ def create_manual_visit(
 def edit_visit_record(
     visit_id: int,
     plate_number: Optional[str] = Form(None),
+    color: Optional[str] = Form(None),
+    brand: Optional[str] = Form(None),
     zone: Optional[str] = Form(None),
     entry_timestamp: Optional[str] = Form(None),
     exit_timestamp: Optional[str] = Form(None),
@@ -715,22 +717,35 @@ def edit_visit_record(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Allows manual editing of an existing visit log (e.g. if AI misread plate number)"""
+    """Allows manual editing of an existing visit log (e.g. if AI misread plate number or brand/color)"""
     visit = db.query(Visit).filter(Visit.id == visit_id).first()
     if not visit:
         raise HTTPException(status_code=404, detail="Visit record not found")
         
     visit.manually_edited = True
     
+    target_plate = visit.plate_number
     if plate_number is not None:
         plate_cleaned = re.sub(r'[^A-Z0-9]', '', plate_number.upper())
         # Ensure vehicle exists
         vehicle = db.query(Vehicle).filter(Vehicle.plate_number == plate_cleaned).first()
         if not vehicle:
-            vehicle = Vehicle(plate_number=plate_cleaned, color="Unknown", brand="Unknown")
+            old_veh = db.query(Vehicle).filter(Vehicle.plate_number == visit.plate_number).first()
+            inh_col = old_veh.color if old_veh else "Unknown"
+            inh_brd = old_veh.brand if old_veh else "Unknown"
+            vehicle = Vehicle(plate_number=plate_cleaned, color=inh_col, brand=inh_brd)
             db.add(vehicle)
             db.flush()
         visit.plate_number = plate_cleaned
+        target_plate = plate_cleaned
+
+    # Update vehicle master record brand and color if provided
+    vehicle_rec = db.query(Vehicle).filter(Vehicle.plate_number == target_plate).first()
+    if vehicle_rec:
+        if color is not None and color.strip():
+            vehicle_rec.color = color.strip()
+        if brand is not None and brand.strip():
+            vehicle_rec.brand = brand.strip()
         
     if zone is not None:
         if zone not in ["Zone A", "Zone B"]:
