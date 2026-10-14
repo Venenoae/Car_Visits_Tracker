@@ -469,19 +469,32 @@ def main():
         # Determine Motion Direction
         direction = None
 
+        # Check trajectory origin if available
+        start_cy = trajectory[0][2] if len(trajectory) > 0 else None
+        start_cx = trajectory[0][1] if len(trajectory) > 0 else None
+        latest_bw = vehicle_box[2] if vehicle_box is not None else 0
+
         # 1. Centroid Sequential Tripwires
         # Top -> Down crossing within 0.3s - 3.5s = ENTRY
+        # Strictest requirement: Entry MUST originate from outside the ramp (start_cy <= y_top + 25)
+        # and vehicle must have substantial width (>= 130px)
         if top_cross_down_time > 0 and bottom_cross_down_time > 0:
             if top_cross_down_time < bottom_cross_down_time and (bottom_cross_down_time - top_cross_down_time) < 3.5:
-                direction = "Entry"
-                last_status_msg = "Top-to-Bottom Crossing -> ENTRY (Check-In)"
+                if start_cy is None or start_cy <= (y_top + 25):
+                    direction = "Entry"
+                    last_status_msg = "Top-to-Bottom Ramp Crossing -> ENTRY (Check-In)"
+                else:
+                    last_status_msg = "Indoor Motion Ignored (Did not originate from outside ramp)"
                 top_cross_down_time = 0
                 bottom_cross_down_time = 0
         # Bottom -> Top crossing within 0.3s - 3.5s = EXIT
         elif bottom_cross_up_time > 0 and top_cross_up_time > 0:
             if bottom_cross_up_time < top_cross_up_time and (top_cross_up_time - bottom_cross_up_time) < 3.5:
-                direction = "Exit"
-                last_status_msg = "Bottom-to-Top Crossing -> EXIT (Check-Out)"
+                if start_cy is None or start_cy >= (y_bottom - 25):
+                    direction = "Exit"
+                    last_status_msg = "Bottom-to-Top Ramp Crossing -> EXIT (Check-Out)"
+                else:
+                    last_status_msg = "Ramp Outward Motion Ignored"
                 bottom_cross_up_time = 0
                 top_cross_up_time = 0
 
@@ -493,38 +506,36 @@ def main():
                 start_pts = trajectory[:3]
                 end_pts = trajectory[-3:]
 
-                start_cx = sum(p[1] for p in start_pts) / len(start_pts)
-                start_cy = sum(p[2] for p in start_pts) / len(start_pts)
-                start_area = sum(p[3] for p in start_pts) / len(start_pts)
+                s_cx = sum(p[1] for p in start_pts) / len(start_pts)
+                s_cy = sum(p[2] for p in start_pts) / len(start_pts)
+                s_area = sum(p[3] for p in start_pts) / len(start_pts)
 
                 end_cx = sum(p[1] for p in end_pts) / len(end_pts)
                 end_cy = sum(p[2] for p in end_pts) / len(end_pts)
                 end_area = sum(p[3] for p in end_pts) / len(end_pts)
 
-                dx = end_cx - start_cx
-                dy = end_cy - start_cy
-                area_ratio = end_area / max(start_area, 1.0)
+                dx = end_cx - s_cx
+                dy = end_cy - s_cy
+                area_ratio = end_area / max(s_area, 1.0)
 
                 # Filter out horizontal street cross-traffic
                 if abs(dx) > (abs(dy) * 1.3) and abs(dx) > 40:
                     last_status_msg = "Street Cross Traffic Ignored (Horizontal)"
                 else:
                     # Vertical motion down ramp / driveway
-                    if dy > 30:
-                        # Moving Top -> Down (Approaching camera)
+                    if dy > 30 and (s_cy <= y_top + 25):
+                        # Moving Top -> Down (Approaching from outside)
                         current_direction_hint = "Entry"
-                        # Confirmed entry if: crossed top downward, or area enlarged, or reached gate base
-                        if (top_cross_down_time > 0) or (area_ratio >= 1.05) or (end_cy >= (y_bottom - 20)):
+                        if (top_cross_down_time > 0) or (area_ratio >= 1.05 and end_cy >= (y_bottom - 20)):
                             direction = "Entry"
-                            last_status_msg = f"Vector Down (dy=+{int(dy)}px, scale={area_ratio:.2f}) -> ENTRY"
+                            last_status_msg = f"Ramp Inward Vector (dy=+{int(dy)}px, scale={area_ratio:.2f}) -> ENTRY"
 
-                    elif dy < -30:
-                        # Moving Down -> Top (Leaving camera)
+                    elif dy < -30 and (s_cy >= y_bottom - 25):
+                        # Moving Down -> Top (Leaving from inside bay)
                         current_direction_hint = "Exit"
-                        # Confirmed exit if: crossed bottom upward, or area shrank, or started near gate base
-                        if (bottom_cross_up_time > 0) or (area_ratio <= 0.95) or (start_cy >= (y_bottom - 20)):
+                        if (bottom_cross_up_time > 0) or (area_ratio <= 0.95 and end_cy <= (y_top + 20)):
                             direction = "Exit"
-                            last_status_msg = f"Vector Up (dy={int(dy)}px, scale={area_ratio:.2f}) -> EXIT"
+                            last_status_msg = f"Ramp Outward Vector (dy={int(dy)}px, scale={area_ratio:.2f}) -> EXIT"
 
         # Draw Real-time Direction Arrow HUD on Preview
         if current_direction_hint == "Entry" or direction == "Entry":
