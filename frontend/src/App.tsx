@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { 
   Car, Shield, LogIn, LogOut, Info, Plus, 
-  MapPin, Clock, CheckCircle, Search, User, Phone, Edit, Settings
+  MapPin, Clock, CheckCircle, Search, User, Phone, Edit, Settings, AlertTriangle
 } from 'lucide-react';
 import CameraSettings from './CameraSettings';
 
@@ -107,6 +107,8 @@ export default function App() {
   
   const [visitEditForm, setVisitEditForm] = useState({
     plate_number: '',
+    brand: '',
+    color: '',
     zone: 'Zone A',
     entry_timestamp: '',
     exit_timestamp: '',
@@ -151,28 +153,103 @@ export default function App() {
   }
   const [pendingScans, setPendingScans] = useState<PendingScan[]>([]);
 
-  // Play a browser-synthesized notification sound for scan events
-  const playNotificationSound = () => {
+  // Web Audio Chimes
+  const playEntryChime = () => {
     try {
       const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
       if (!AudioCtx) return;
       const ctx = new AudioCtx();
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.connect(gain);
-      gain.connect(ctx.destination);
+      const now = ctx.currentTime;
       
-      osc.type = 'sine';
-      osc.frequency.setValueAtTime(600, ctx.currentTime); // 600Hz tone
-      gain.gain.setValueAtTime(0.08, ctx.currentTime);
-      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.25);
-      
-      osc.start();
-      osc.stop(ctx.currentTime + 0.25);
+      // Note 1: D5 (587.33 Hz)
+      const osc1 = ctx.createOscillator();
+      const gain1 = ctx.createGain();
+      osc1.type = 'sine';
+      osc1.frequency.setValueAtTime(587.33, now);
+      gain1.gain.setValueAtTime(0.09, now);
+      gain1.gain.exponentialRampToValueAtTime(0.001, now + 0.3);
+      osc1.connect(gain1);
+      gain1.connect(ctx.destination);
+      osc1.start(now);
+      osc1.stop(now + 0.3);
+
+      // Note 2: A5 (880 Hz) - bell-like upward resolution
+      const osc2 = ctx.createOscillator();
+      const gain2 = ctx.createGain();
+      osc2.type = 'sine';
+      osc2.frequency.setValueAtTime(880, now + 0.12);
+      gain2.gain.setValueAtTime(0.09, now + 0.12);
+      gain2.gain.exponentialRampToValueAtTime(0.001, now + 0.5);
+      osc2.connect(gain2);
+      gain2.connect(ctx.destination);
+      osc2.start(now + 0.12);
+      osc2.stop(now + 0.5);
     } catch (e) {
       console.log('Audio feedback blocked by browser settings.');
     }
   };
+
+  const playExitChime = () => {
+    try {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioCtx) return;
+      const ctx = new AudioCtx();
+      const now = ctx.currentTime;
+      
+      // Note 1: A5 (880 Hz)
+      const osc1 = ctx.createOscillator();
+      const gain1 = ctx.createGain();
+      osc1.type = 'sine';
+      osc1.frequency.setValueAtTime(880, now);
+      gain1.gain.setValueAtTime(0.08, now);
+      gain1.gain.exponentialRampToValueAtTime(0.001, now + 0.25);
+      osc1.connect(gain1);
+      gain1.connect(ctx.destination);
+      osc1.start(now);
+      osc1.stop(now + 0.25);
+
+      // Note 2: D5 (587.33 Hz) - calming downward release
+      const osc2 = ctx.createOscillator();
+      const gain2 = ctx.createGain();
+      osc2.type = 'sine';
+      osc2.frequency.setValueAtTime(587.33, now + 0.12);
+      gain2.gain.setValueAtTime(0.08, now + 0.12);
+      gain2.gain.exponentialRampToValueAtTime(0.001, now + 0.45);
+      osc2.connect(gain2);
+      gain2.connect(ctx.destination);
+      osc2.start(now + 0.12);
+      osc2.stop(now + 0.45);
+    } catch (e) {
+      console.log('Audio feedback blocked by browser settings.');
+    }
+  };
+
+  const playUnreadableAlertSound = () => {
+    try {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioCtx) return;
+      const ctx = new AudioCtx();
+      const now = ctx.currentTime;
+      
+      // Short double alert chirp
+      [0, 0.15].forEach(delay => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(740, now + delay);
+        gain.gain.setValueAtTime(0.12, now + delay);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + delay + 0.1);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(now + delay);
+        osc.stop(now + delay + 0.1);
+      });
+    } catch (e) {
+      console.log('Audio feedback blocked by browser settings.');
+    }
+  };
+
+  const playNotificationSound = playEntryChime;
 
   // Play a deeper, buzzing alarm sound for invalid activities
   const playAlertSound = () => {
@@ -200,13 +277,13 @@ export default function App() {
       
       osc1.start();
       osc2.start();
-      
       osc1.stop(ctx.currentTime + 0.55);
       osc2.stop(ctx.currentTime + 0.55);
     } catch (e) {
       console.log('Audio feedback blocked by browser settings.');
     }
   };
+
 
   const triggerAlert = (alert: SystemAlert) => {
     playAlertSound();
@@ -295,7 +372,13 @@ export default function App() {
         ]);
       } else if (msg.event_type === "VISIT_UPDATE") {
         console.log("[WS] New scan event received:", msg.visit);
-        playNotificationSound();
+        if (msg.visit.plate_number && (msg.visit.plate_number.startsWith('UNREADABLE-') || msg.visit.plate_number.startsWith('CAR-'))) {
+          playUnreadableAlertSound();
+        } else if (msg.visit.status === 'Completed') {
+          playExitChime();
+        } else {
+          playEntryChime();
+        }
         
         // Remove from pending scans
         if (msg.scan_id) {
@@ -504,6 +587,8 @@ export default function App() {
     setSelectedVisit(visit);
     setVisitEditForm({
       plate_number: visit.plate_number,
+      brand: visit.brand || '',
+      color: visit.color || '',
       zone: visit.zone,
       entry_timestamp: new Date(visit.entry_timestamp).toISOString().slice(0, 16),
       exit_timestamp: visit.exit_timestamp ? new Date(visit.exit_timestamp).toISOString().slice(0, 16) : '',
@@ -521,6 +606,8 @@ export default function App() {
 
     const bodyForm = new FormData();
     bodyForm.append('plate_number', visitEditForm.plate_number);
+    bodyForm.append('brand', visitEditForm.brand);
+    bodyForm.append('color', visitEditForm.color);
     bodyForm.append('zone', visitEditForm.zone);
     bodyForm.append('entry_timestamp', new Date(visitEditForm.entry_timestamp).toISOString());
     bodyForm.append('status', visitEditForm.status);
@@ -999,13 +1086,28 @@ export default function App() {
                           {/* Event meta and AI specs */}
                           <div className="event-details">
                             <div className="event-header">
-                              <span className="plate-badge">{visit.plate_number}</span>
+                              {visit.plate_number.startsWith('UNREADABLE-') || visit.plate_number.startsWith('CAR-') ? (
+                                <span className="plate-badge" style={{ background: 'rgba(239, 68, 68, 0.15)', color: '#EF4444', borderColor: '#EF4444', display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
+                                  <AlertTriangle size={14} /> {visit.plate_number}
+                                </span>
+                              ) : (
+                                <span className="plate-badge">{visit.plate_number}</span>
+                              )}
                               <span className={`badge ${isExit ? 'badge-exit' : 'badge-entry'}`}>
                                 {isExit ? 'Exited' : 'Entered'}
                               </span>
                               <span className="badge badge-zone">{visit.zone}</span>
                               {visit.manually_created && <span className="badge" style={{ background: 'rgba(245, 158, 11, 0.1)', color: 'var(--warning)', border: '1px solid rgba(245, 158, 11, 0.2)' }}>Manual API</span>}
                               {visit.manually_edited && <span className="badge" style={{ background: 'rgba(99, 102, 241, 0.1)', color: 'var(--primary)', border: '1px solid rgba(99, 102, 241, 0.2)' }}>Edited</span>}
+                              {(visit.plate_number.startsWith('UNREADABLE-') || visit.plate_number.startsWith('CAR-')) && (
+                                <button 
+                                  className="btn btn-outline" 
+                                  style={{ padding: '0.2rem 0.6rem', fontSize: '0.75rem', borderColor: '#EF4444', color: '#EF4444', fontWeight: 600 }}
+                                  onClick={() => openEditVisit(visit)}
+                                >
+                                  Identify Plate
+                                </button>
+                              )}
                             </div>
                             
                             <div className="event-meta">
@@ -1380,17 +1482,61 @@ export default function App() {
               <button className="modal-close" onClick={() => setShowEditVisitModal(false)}>x</button>
             </div>
             
+            {/* Snapshot Preview if available */}
+            {selectedVisit && (selectedVisit.entry_image_url || selectedVisit.exit_image_url) && (
+              <div style={{ marginBottom: '1rem', borderRadius: '10px', overflow: 'hidden', border: '1px solid var(--border-light)', maxHeight: '200px', display: 'flex', justifyContent: 'center', background: '#000' }}>
+                <img 
+                  src={`${STATIC_BASE}${selectedVisit.entry_image_url || selectedVisit.exit_image_url}`} 
+                  alt="Vehicle Gate Capture" 
+                  style={{ maxHeight: '200px', width: 'auto', objectFit: 'contain' }}
+                />
+              </div>
+            )}
+
             <form onSubmit={handleSaveVisitEdit} style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
               <div className="form-group">
-                <label className="form-label">Plate Number</label>
+                <label className="form-label">Plate Number (Clean uppercase, e.g. M 11770 or 55456)</label>
                 <input 
                   type="text" 
                   className="form-input" 
-                  style={{ textTransform: 'uppercase' }}
+                  style={{ textTransform: 'uppercase', fontWeight: 600, fontSize: '1.1rem' }}
                   value={visitEditForm.plate_number}
                   onChange={e => setVisitEditForm({...visitEditForm, plate_number: e.target.value})}
+                  placeholder="e.g. 55456 or M 11770"
                   required 
                 />
+              </div>
+
+              <div className="form-row">
+                <div className="form-group">
+                  <label className="form-label">Brand / Make</label>
+                  <input 
+                    type="text" 
+                    className="form-input" 
+                    value={visitEditForm.brand}
+                    onChange={e => setVisitEditForm({...visitEditForm, brand: e.target.value})}
+                    placeholder="e.g. Porsche, Toyota, Mercedes"
+                  />
+                </div>
+                
+                <div className="form-group">
+                  <label className="form-label">Color</label>
+                  <select 
+                    className="form-select"
+                    value={visitEditForm.color}
+                    onChange={e => setVisitEditForm({...visitEditForm, color: e.target.value})}
+                  >
+                    <option value="Unknown">Select Color...</option>
+                    <option value="White">White</option>
+                    <option value="Black">Black</option>
+                    <option value="Silver/Grey">Silver / Grey</option>
+                    <option value="Blue">Blue</option>
+                    <option value="Red">Red</option>
+                    <option value="Brown/Gold">Brown / Gold</option>
+                    <option value="Green">Green</option>
+                    <option value="Yellow">Yellow</option>
+                  </select>
+                </div>
               </div>
 
               <div className="form-row">
