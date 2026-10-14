@@ -5,6 +5,7 @@ import numpy as np
 from PIL import Image
 from ultralytics import YOLO
 import easyocr
+from difflib import SequenceMatcher
 
 import threading
 
@@ -49,33 +50,33 @@ def disambiguate_digits(text: str) -> str:
 
 def clean_plate_candidate(raw_text: str):
     """
-    Cleans raw OCR text into standard UAE / GCC license plate formats:
-    - Dubai: [Letter] [Digits] e.g. 'M 11770', 'C 90371', 'AA 1234'
-    - Abu Dhabi: [Category] [Digits] e.g. '15 51913' -> '51913'
-    - Sharjah / Northern Emirates: [1-4 / Letter] [Digits]
-    - Plain Digits: 3 to 6 digits (e.g. '51913', '24384', '88874')
+    Cleans raw OCR text into standard UAE license plate formats:
+    - Abu Dhabi: [Category] [Digits] e.g. '10 55456', '4 12345', '50 9999'
+    - Dubai: [Letter(s)] [Digits] e.g. 'M 11770', 'AA 1234', 'C 90371'
+    - Plain Digits: 3 to 6 digits (e.g. '55456', '24384')
     """
     cleaned = re.sub(r'[^A-Z0-9\s]', '', raw_text.upper()).strip()
     words = [w for w in cleaned.split() if w not in IGNORED_WORDS and len(w) >= 1]
     cleaned = " ".join(words)
 
-    # 1. Dubai Format: 1 or 2 letter code + 1 to 5 digits (e.g. 'M 11770', 'AA 1234', 'C 90371')
+    # 1. Abu Dhabi Category Format: Category prefix (1-50) + 3-6 digits
+    match_ad = re.search(r'\b(1|2|3|4|5|6|7|8|9|10|11|12|14|15|16|17|50)\s+([0-9OIl!SBZG]{3,6})\b', cleaned)
+    if match_ad:
+        cat = match_ad.group(1)
+        digits = disambiguate_digits(match_ad.group(2))
+        if digits.isdigit() and 3 <= len(digits) <= 6:
+            return f"{cat} {digits}", len(digits) + 3
+
+    # 2. Dubai Format: 1 or 2 letter code + 1 to 5 digits (e.g. 'M 11770', 'AA 1234')
     match_dubai = re.search(r'\b([A-Z]{1,2})\s*([0-9OIl!SBZG]{1,5})\b', cleaned)
     if match_dubai:
         letter_code = match_dubai.group(1)
         raw_num = match_dubai.group(2)
         digits = disambiguate_digits(raw_num)
         if digits.isdigit() and 1 <= len(digits) <= 5:
-            return f"{letter_code} {digits}", len(digits)
+            return f"{letter_code} {digits}", len(digits) + 3
 
-    # 2. Abu Dhabi Category Format: Category prefix + 3-6 digits (e.g. '15 51913' or '50 12345')
-    match_ad = re.search(r'\b(?:1|2|3|4|5|6|7|8|9|10|11|12|14|15|16|17|50)\s+([0-9OIl!SBZG]{3,6})\b', cleaned)
-    if match_ad:
-        digits = disambiguate_digits(match_ad.group(1))
-        if digits.isdigit():
-            return digits, len(digits)
-
-    # 3. Plain Numeric Plates: 3 to 6 digits (e.g. '51913', '24384', '88874')
+    # 3. Plain Numeric Plates: 3 to 6 digits (e.g. '51913', '24384', '55456')
     tokens = cleaned.split()
     for tok in tokens:
         if 3 <= len(tok) <= 6:
@@ -91,7 +92,7 @@ def clean_plate_candidate(raw_text: str):
             code = m.group(1)
             digits = disambiguate_digits(m.group(2))
             if digits.isdigit():
-                return f"{code} {digits}", len(digits)
+                return f"{code} {digits}", len(digits) + 3
         
         digit_count = sum(c.isdigit() for c in compact)
         if digit_count >= 3:
@@ -102,77 +103,118 @@ def clean_plate_candidate(raw_text: str):
 
 def extract_license_plate(vehicle_img) -> str:
     """
-    Multi-pass OCR reader with glare reduction:
-    Pass 1: Raw vehicle crop
-    Pass 2: Lower bumper upscaled 2.5x with standard CLAHE
-    Pass 3: Bilateral Filter + CLAHE (smooths glass reflections/headlight glare while keeping digits crisp)
-    Pass 4: Otsu binarization
-    Pass 5: High-contrast CLAHE (clipLimit=4.5) for shadowed plates
+    Multi-pass OCR reader with UAE spatial horizontal clustering and category expansion:
+    1. Samples lower bumper where license plates reside.
+    2. Runs multi-pass filters (Upscaled CLAHE, Bilateral Glare Reduction, Otsu).
+    3. Clusters horizontally-adjacent boxes (e.g. ['10', '55456'] -> '10 55456').
+    4. If a plain numeric plate is found, expands to the left to catch category box.
     """
     init_models()
     if vehicle_img is None or vehicle_img.size == 0:
         return "UNKNOWN"
 
     candidates = []
-
-    # Pass 1: Raw vehicle crop
-    results_raw = ocr_reader.readtext(vehicle_img)
-    for (bbox, text, conf) in results_raw:
-        plate_str, digit_count = clean_plate_candidate(text)
-        if plate_str and conf > 0.15:
-            score = conf + (digit_count * 0.15)
-            candidates.append((plate_str, score))
-
-    # Passes 2-5: Focused bumper region
     vh, vw = vehicle_img.shape[:2]
-    if vh >= 40 and vw >= 60:
-        bumper_crop = vehicle_img[int(vh * 0.35):vh, :]
-        bumper_up = cv2.resize(bumper_crop, (0, 0), fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
-        gray = cv2.cvtColor(bumper_up, cv2.COLOR_BGR2GRAY)
 
-        # Pass 2: CLAHE (clipLimit=3.0)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        enh = clahe.apply(gray)
-        results_enh = ocr_reader.readtext(enh)
-        for (bbox, text, conf) in results_enh:
-            plate_str, digit_count = clean_plate_candidate(text)
-            if plate_str and conf > 0.15:
-                score = conf + (digit_count * 0.20) + 0.15
-                candidates.append((plate_str, score))
+    # Sample lower bumper area (where plates are mounted)
+    bumper_crop = vehicle_img[int(vh * 0.25):vh, :] if vh >= 40 else vehicle_img
+    
+    gray = cv2.cvtColor(bumper_crop, cv2.COLOR_BGR2GRAY)
+    bumper_up = cv2.resize(bumper_crop, (0, 0), fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+    
+    passes = [
+        ("bumper_up", bumper_up),
+        ("clahe", cv2.createCLAHE(clipLimit=3.5, tileGridSize=(8, 8)).apply(cv2.resize(gray, (0, 0), fx=2.0, fy=2.0))),
+        ("bilateral", cv2.createCLAHE(clipLimit=3.5, tileGridSize=(8, 8)).apply(cv2.bilateralFilter(cv2.resize(gray, (0, 0), fx=2.0, fy=2.0), 9, 75, 75))),
+    ]
+    
+    for pass_name, proc_img in passes:
+        ocr_res = ocr_reader.readtext(proc_img)
+        if not ocr_res:
+            continue
+            
+        scale_x = proc_img.shape[1] / bumper_crop.shape[1]
+        scale_y = proc_img.shape[0] / bumper_crop.shape[0]
 
-        # Pass 3: Bilateral Filter + CLAHE (glare & reflection reduction)
-        denoised = cv2.bilateralFilter(gray, 9, 75, 75)
-        clahe_bi = cv2.createCLAHE(clipLimit=3.5, tileGridSize=(8, 8))
-        enh_bi = clahe_bi.apply(denoised)
-        results_bi = ocr_reader.readtext(enh_bi)
-        for (bbox, text, conf) in results_bi:
-            plate_str, digit_count = clean_plate_candidate(text)
-            if plate_str and conf > 0.15:
-                score = conf + (digit_count * 0.20) + 0.18
-                candidates.append((plate_str, score))
+        boxes = []
+        for bbox, text, conf in ocr_res:
+            if not text.strip() or conf < 0.15:
+                continue
+            bx1 = bbox[0][0] / scale_x
+            by1 = bbox[0][1] / scale_y
+            bx2 = bbox[1][0] / scale_x
+            by2 = bbox[2][1] / scale_y
+            cx = (bx1 + bx2) / 2.0
+            cy = (by1 + by2) / 2.0
+            h = abs(by2 - by1)
+            w = abs(bx2 - bx1)
+            boxes.append({'text': text.strip(), 'cx': cx, 'cy': cy, 'h': h, 'w': w, 'box': [bx1, by1, bx2, by2], 'conf': conf})
 
-        # Pass 4: Otsu Adaptive Binarization
-        _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        results_otsu = ocr_reader.readtext(otsu)
-        for (bbox, text, conf) in results_otsu:
-            plate_str, digit_count = clean_plate_candidate(text)
-            if plate_str and conf > 0.20:
-                score = conf + (digit_count * 0.20) + 0.10
-                candidates.append((plate_str, score))
+        # Horizontal clustering (group boxes with similar Y on the same horizontal line)
+        clusters = []
+        for b in sorted(boxes, key=lambda x: x['cx']):
+            merged = False
+            for cl in clusters:
+                avg_cy = sum(item['cy'] for item in cl) / len(cl)
+                avg_h = sum(item['h'] for item in cl) / len(cl)
+                if abs(b['cy'] - avg_cy) < max(avg_h, b['h']) * 0.8:
+                    cl.append(b)
+                    merged = True
+                    break
+            if not merged:
+                clusters.append([b])
 
-        # Pass 5: High-contrast CLAHE (clipLimit=4.5) for dark/shadowed plates
-        clahe_high = cv2.createCLAHE(clipLimit=4.5, tileGridSize=(8, 8))
-        enh_high = clahe_high.apply(gray)
-        results_high = ocr_reader.readtext(enh_high)
-        for (bbox, text, conf) in results_high:
-            plate_str, digit_count = clean_plate_candidate(text)
-            if plate_str and conf > 0.15:
-                score = conf + (digit_count * 0.20) + 0.12
-                candidates.append((plate_str, score))
+        # Evaluate clustered lines
+        for cl in clusters:
+            cl.sort(key=lambda x: x['cx'])
+            joined_str = " ".join(item['text'] for item in cl)
+            plate_str, bonus = clean_plate_candidate(joined_str)
+            if plate_str:
+                conf_avg = sum(item['conf'] for item in cl) / len(cl)
+                candidates.append((plate_str, conf_avg + bonus, cl))
 
-    if candidates:
-        candidates.sort(key=lambda x: x[1], reverse=True)
-        return candidates[0][0]
+        # Also evaluate individual boxes
+        for b in boxes:
+            plate_str, bonus = clean_plate_candidate(b['text'])
+            if plate_str:
+                candidates.append((plate_str, b['conf'] + bonus, [b]))
+
+    # Prefix expansion check:
+    # If best candidate is a plain numeric plate (e.g. '55456' without category),
+    # expand the crop to the left in the bumper to catch the Abu Dhabi / Dubai category prefix!
+    final_candidates = []
+    for plate_str, score, cl in candidates:
+        if " " not in plate_str and plate_str.isdigit():
+            min_x = min(item['box'][0] for item in cl)
+            max_x = max(item['box'][2] for item in cl)
+            min_y = min(item['box'][1] for item in cl)
+            max_y = max(item['box'][3] for item in cl)
+            bw = max_x - min_x
+            bh = max_y - min_y
+
+            ex_x1 = max(0, int(min_x - bw * 1.3))
+            ex_x2 = min(bumper_crop.shape[1], int(max_x + bw * 0.2))
+            ex_y1 = max(0, int(min_y - bh * 0.3))
+            ex_y2 = min(bumper_crop.shape[0], int(max_y + bh * 0.3))
+
+            expanded_sub = bumper_crop[ex_y1:ex_y2, ex_x1:ex_x2]
+            if expanded_sub.size > 0:
+                sub_res = ocr_reader.readtext(expanded_sub)
+                sub_items = []
+                for s_bbox, s_text, s_conf in sub_res:
+                    s_cx = (s_bbox[0][0] + s_bbox[1][0]) / 2.0
+                    sub_items.append((s_cx, s_text, s_conf))
+                sub_items.sort(key=lambda x: x[0])
+                expanded_joined = " ".join(x[1] for x in sub_items)
+                exp_plate, exp_bonus = clean_plate_candidate(expanded_joined)
+                if exp_plate and " " in exp_plate:
+                    final_candidates.append((exp_plate, score + 3.0))
+                    continue
+        final_candidates.append((plate_str, score))
+
+    if final_candidates:
+        final_candidates.sort(key=lambda x: x[1], reverse=True)
+        return final_candidates[0][0]
 
     return "UNKNOWN"
 
@@ -259,18 +301,55 @@ def classify_color(vehicle_img) -> str:
 
 def classify_brand(vehicle_img, raw_text_tokens=None) -> str:
     """
-    Classifies vehicle brand by searching OCR tokens for recognized brand emblems/badges.
-    Returns 'Unknown' if no emblem text is detected, allowing fleet lookup or manual edit.
+    Classifies vehicle brand:
+    1. Checks raw OCR tokens if provided.
+    2. Scans the front grille / rear badge area (upper 45% height, center 25%-75% width).
+    3. Runs EasyOCR on 2x upscaled badge crop.
+    4. Performs fuzzy matching (SequenceMatcher) against KNOWN_BRANDS.
+    5. Recognizes performance sub-brands (e.g. NISMO -> Nissan, AMG -> Mercedes-Benz, M -> BMW).
     """
-    if raw_text_tokens:
-        for token in raw_text_tokens:
-            clean_tok = re.sub(r'[^A-Z]', '', token.upper())
+    init_models()
+    if vehicle_img is None or vehicle_img.size == 0:
+        return "Unknown"
+
+    vh, vw = vehicle_img.shape[:2]
+    # Sample upper center grille / badge region
+    grille_crop = vehicle_img[0:int(vh * 0.45), int(vw * 0.25):int(vw * 0.75)]
+    if grille_crop.shape[0] >= 20 and grille_crop.shape[1] >= 30:
+        grille_up = cv2.resize(grille_crop, (0, 0), fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+        res = ocr_reader.readtext(grille_up)
+
+        best_brand = "Unknown"
+        best_sim = 0.0
+
+        for bbox, text, conf in res:
+            clean_t = re.sub(r'[^A-Z]', '', text.upper())
+            if not clean_t:
+                continue
+
+            # Special sub-brand mappings
+            if "NISMO" in clean_t:
+                return "Nissan"
+            if "AMG" in clean_t:
+                return "Mercedes-Benz"
+
             for brand in KNOWN_BRANDS:
                 brand_clean = re.sub(r'[^A-Z]', '', brand)
-                if brand_clean == clean_tok or (len(brand_clean) >= 5 and brand_clean in clean_tok):
-                    return brand.title()
+                sim = SequenceMatcher(None, clean_t, brand_clean).ratio()
+                if clean_t in brand_clean and len(clean_t) >= 4:
+                    sim = 1.0
+                if brand_clean in clean_t:
+                    sim = 1.0
+
+                if sim > 0.65 and sim > best_sim:
+                    best_sim = sim
+                    best_brand = brand.title()
+
+        if best_brand != "Unknown":
+            return best_brand
 
     return "Unknown"
+
 
 
 def run_ai_pipeline(image_path: str):
