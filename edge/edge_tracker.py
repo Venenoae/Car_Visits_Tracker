@@ -15,15 +15,17 @@ ZONE = "Zone A"                                  # 'Zone A' (Ground) or 'Zone B'
 CAMERA_INDEX = 0                                # 0 is standard for Logitech USB webcam
 WEB_STREAM_PORT = 8080                          # Port to view live feed in browser
 
-# Virtual Tripwires calibrated for outside street / ramp (percentages of frame height)
-# TOP LINE: Distant street edge / upper ramp
-TRIPWIRE_TOP_Y = 0.36
-# BOTTOM LINE: Lower driveway / base of outside ramp (above indoor door sill)
-TRIPWIRE_BOTTOM_Y = 0.58
+# Virtual Tripwires calibrated for outside ramp to indoor bay (percentages of frame height)
+# TOP LINE: Outer ramp / glass door sill
+TRIPWIRE_TOP_Y = 0.34
+# BOTTOM LINE: Indoor bay floor where car enters and stops
+TRIPWIRE_BOTTOM_Y = 0.52
 
-# Mask out indoor showroom floor where staff walk (anything below y=0.64 is ignored)
-DETECTION_Y_MIN = 0.30
-DETECTION_Y_MAX = 0.64
+# Detection corridor:
+# From top ramp (y=0.18) down to car stop position (y=0.65). 
+# Anything below y=0.65 is staff walking floor and is completely masked out.
+DETECTION_Y_MIN = 0.18
+DETECTION_Y_MAX = 0.65
 
 # Contour area and width for distant cars outside (15-20 meters away through glass)
 MIN_CONTOUR_AREA = 3200
@@ -317,14 +319,17 @@ def main():
     back_sub = cv2.createBackgroundSubtractorMOG2(history=300, varThreshold=30, detectShadows=True)
 
     last_capture_time = 0
-    top_trigger_time = 0
-    bottom_trigger_time = 0
-    last_status_msg = "Ready - Waiting for vehicle"
+    top_cross_down_time = 0
+    bottom_cross_down_time = 0
+    bottom_cross_up_time = 0
+    top_cross_up_time = 0
+    last_status_msg = "Ready - Monitoring Gate"
 
     # Centroid trajectory and close-zone best-plate buffer
-    trajectory = []  # List of (timestamp, cy, area)
+    trajectory = []  # List of (timestamp, cx, cy, area, bw, bh)
     best_vehicle_frame = None
     max_tracked_area = 0
+    prev_cy = None
 
     consecutive_failures = 0
     while True:
@@ -351,7 +356,6 @@ def main():
         y_roi_max = int(h * DETECTION_Y_MAX)
 
         # 1. Mask out indoor showroom floor where staff walk and distant sky
-        # This completely prevents walking employees from ever triggering false alerts!
         motion_frame = frame.copy()
         motion_frame[:y_roi_min, :] = 0
         motion_frame[y_roi_max:, :] = 0
@@ -369,14 +373,17 @@ def main():
         # Create display copy with annotations for live preview
         display_frame = frame.copy()
 
-        # Draw Outdoor Street & Ramp Detection Corridor
-        cv2.line(display_frame, (0, y_top), (w, y_top), (0, 0, 255), 2)  # Red: Top Line
-        cv2.putText(display_frame, f"OUTSIDE RAMP / STREET TOP ({int(TRIPWIRE_TOP_Y*100)}%)", (20, y_top - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
+        # Draw Outdoor Street & Ramp Detection Corridor with active status
+        top_color = (0, 0, 255) if (current_time - top_cross_down_time < 1.5 or current_time - top_cross_up_time < 1.5) else (0, 100, 255)
+        bot_color = (0, 255, 0) if (current_time - bottom_cross_down_time < 1.5 or current_time - bottom_cross_up_time < 1.5) else (0, 200, 100)
 
-        cv2.line(display_frame, (0, y_bottom), (w, y_bottom), (0, 255, 0), 2)  # Green: Bottom Line
-        cv2.putText(display_frame, f"OUTSIDE DRIVEWAY BASE ({int(TRIPWIRE_BOTTOM_Y*100)}%)", (20, y_bottom - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+        cv2.line(display_frame, (0, y_top), (w, y_top), top_color, 2)
+        cv2.putText(display_frame, f"TRIPWIRE TOP (Ramp / Street) [{int(TRIPWIRE_TOP_Y*100)}%]", (20, y_top - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, top_color, 2)
+
+        cv2.line(display_frame, (0, y_bottom), (w, y_bottom), bot_color, 2)
+        cv2.putText(display_frame, f"TRIPWIRE BOTTOM (Gate Threshold) [{int(TRIPWIRE_BOTTOM_Y*100)}%]", (20, y_bottom - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, bot_color, 2)
 
         # Masked Floor Indicator
         cv2.line(display_frame, (0, y_roi_max), (w, y_roi_max), (100, 100, 100), 1)
@@ -413,69 +420,125 @@ def main():
             # Draw moving vehicle bounding box
             cv2.rectangle(display_frame, (x, y), (x + bw, y + bh), (255, 200, 0), 2)
 
-        # Track 2D trajectory (x, y) and best clear frame
+        current_direction_hint = None
+
+        # Track Centroid & Detect Crossing
         if vehicle_box is not None:
             x, y, bw, bh = vehicle_box
             cx = x + (bw // 2)
             cy = y + (bh // 2)
-            trajectory.append((current_time, cx, cy, largest_area_this_frame))
+            trajectory.append((current_time, cx, cy, largest_area_this_frame, bw, bh))
 
-            # Tripwire intersection triggers
-            if y <= y_top <= (y + bh):
-                top_trigger_time = current_time
-            if y <= y_bottom <= (y + bh):
-                bottom_trigger_time = current_time
+            # Centroid tripwire crossings (precise point-crossing avoids multi-line overlap)
+            if prev_cy is not None:
+                # Downward crossing across Top line
+                if prev_cy < y_top <= cy:
+                    top_cross_down_time = current_time
+                # Downward crossing across Bottom line
+                if prev_cy < y_bottom <= cy:
+                    bottom_cross_down_time = current_time
+                # Upward crossing across Bottom line
+                if prev_cy > y_bottom >= cy:
+                    bottom_cross_up_time = current_time
+                # Upward crossing across Top line
+                if prev_cy > y_top >= cy:
+                    top_cross_up_time = current_time
+
+            prev_cy = cy
 
             # Buffer clearest frame when vehicle has maximum clear size in outside zone
             if largest_area_this_frame > max_tracked_area:
                 max_tracked_area = largest_area_this_frame
                 best_vehicle_frame = frame.copy()
 
-        # Prune trajectory to last 2.5 seconds
-        trajectory = [t for t in trajectory if (current_time - t[0]) < 2.5]
+            # Draw Centroid & Trajectory trail
+            cv2.circle(display_frame, (cx, cy), 6, (0, 255, 255), -1)
+        else:
+            prev_cy = None
+
+        # Prune trajectory to last 3.0 seconds
+        trajectory = [t for t in trajectory if (current_time - t[0]) < 3.0]
+
+        # Draw trajectory history on preview
+        if len(trajectory) > 1:
+            for i in range(1, len(trajectory)):
+                pt1 = (int(trajectory[i-1][1]), int(trajectory[i-1][2]))
+                pt2 = (int(trajectory[i][1]), int(trajectory[i][2]))
+                cv2.line(display_frame, pt1, pt2, (0, 255, 255), 2)
 
         # Determine Motion Direction
         direction = None
 
-        # 1. Dual Tripwire Intersection (Ramp Movement)
-        if top_trigger_time > 0 and bottom_trigger_time > 0:
-            if top_trigger_time < bottom_trigger_time and (bottom_trigger_time - top_trigger_time) < 4.0:
+        # 1. Centroid Sequential Tripwires
+        # Top -> Down crossing within 0.3s - 3.5s = ENTRY
+        if top_cross_down_time > 0 and bottom_cross_down_time > 0:
+            if top_cross_down_time < bottom_cross_down_time and (bottom_cross_down_time - top_cross_down_time) < 3.5:
                 direction = "Entry"
-                last_status_msg = "🚗 Ramp Inward Motion -> CHECK-IN (Entry)"
-            elif bottom_trigger_time < top_trigger_time and (top_trigger_time - bottom_trigger_time) < 4.0:
+                last_status_msg = "Top-to-Bottom Crossing -> ENTRY (Check-In)"
+                top_cross_down_time = 0
+                bottom_cross_down_time = 0
+        # Bottom -> Top crossing within 0.3s - 3.5s = EXIT
+        elif bottom_cross_up_time > 0 and top_cross_up_time > 0:
+            if bottom_cross_up_time < top_cross_up_time and (top_cross_up_time - bottom_cross_up_time) < 3.5:
                 direction = "Exit"
-                last_status_msg = "🚙 Ramp Outward Motion -> CHECK-OUT (Exit)"
-            top_trigger_time = 0
-            bottom_trigger_time = 0
+                last_status_msg = "Bottom-to-Top Crossing -> EXIT (Check-Out)"
+                bottom_cross_up_time = 0
+                top_cross_up_time = 0
 
-        # 2. Continuous 2D Centroid Vector (Vertical Ramp Crossing Only)
-        elif len(trajectory) >= 5:
+        # 2. Continuous 2D Motion Vector + Perspective Scale Factor (Fallback / Real-Time)
+        if direction is None and len(trajectory) >= 6:
             dt = trajectory[-1][0] - trajectory[0][0]
             if dt >= 0.28:
-                dx = trajectory[-1][1] - trajectory[0][1]
-                dy = trajectory[-1][2] - trajectory[0][2]
-                latest_y = trajectory[-1][2]
-                initial_y = trajectory[0][2]
+                # Compare average of first 3 points vs last 3 points for smooth vector
+                start_pts = trajectory[:3]
+                end_pts = trajectory[-3:]
 
-                # Movement must be primarily vertical (traveling down or up the entrance ramp)
-                # AND must reach/originate from the showroom threshold line (y_bottom)
-                # This guarantees that horizontal street traffic is NEVER mistaken for an entry or exit!
-                if abs(dy) >= abs(dx) and abs(dy) > 35:
-                    if dy > 35 and latest_y >= (y_bottom - 30):
-                        direction = "Entry"
-                        last_status_msg = "Ramp Inward Vector -> CHECK-IN (Entry)"
-                    elif dy < -35 and initial_y >= (y_bottom - 30):
-                        direction = "Exit"
-                        last_status_msg = "Ramp Outward Vector -> CHECK-OUT (Exit)"
-                elif abs(dx) > abs(dy) and abs(dx) > 50:
-                    # Through street traffic passing horizontally - intentionally ignored
-                    last_status_msg = "Street Cross Traffic Ignored (No Gate Crossing)"
+                start_cx = sum(p[1] for p in start_pts) / len(start_pts)
+                start_cy = sum(p[2] for p in start_pts) / len(start_pts)
+                start_area = sum(p[3] for p in start_pts) / len(start_pts)
+
+                end_cx = sum(p[1] for p in end_pts) / len(end_pts)
+                end_cy = sum(p[2] for p in end_pts) / len(end_pts)
+                end_area = sum(p[3] for p in end_pts) / len(end_pts)
+
+                dx = end_cx - start_cx
+                dy = end_cy - start_cy
+                area_ratio = end_area / max(start_area, 1.0)
+
+                # Filter out horizontal street cross-traffic
+                if abs(dx) > (abs(dy) * 1.3) and abs(dx) > 40:
+                    last_status_msg = "Street Cross Traffic Ignored (Horizontal)"
+                else:
+                    # Vertical motion down ramp / driveway
+                    if dy > 30:
+                        # Moving Top -> Down (Approaching camera)
+                        current_direction_hint = "Entry"
+                        # Confirmed entry if: crossed top downward, or area enlarged, or reached gate base
+                        if (top_cross_down_time > 0) or (area_ratio >= 1.05) or (end_cy >= (y_bottom - 20)):
+                            direction = "Entry"
+                            last_status_msg = f"Vector Down (dy=+{int(dy)}px, scale={area_ratio:.2f}) -> ENTRY"
+
+                    elif dy < -30:
+                        # Moving Down -> Top (Leaving camera)
+                        current_direction_hint = "Exit"
+                        # Confirmed exit if: crossed bottom upward, or area shrank, or started near gate base
+                        if (bottom_cross_up_time > 0) or (area_ratio <= 0.95) or (start_cy >= (y_bottom - 20)):
+                            direction = "Exit"
+                            last_status_msg = f"Vector Up (dy={int(dy)}px, scale={area_ratio:.2f}) -> EXIT"
+
+        # Draw Real-time Direction Arrow HUD on Preview
+        if current_direction_hint == "Entry" or direction == "Entry":
+            cv2.arrowedLine(display_frame, (w - 100, 60), (w - 100, 160), (0, 255, 0), 5, tipLength=0.3)
+            cv2.putText(display_frame, "ENTERING", (w - 180, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        elif current_direction_hint == "Exit" or direction == "Exit":
+            cv2.arrowedLine(display_frame, (w - 100, 160), (w - 100, 60), (255, 200, 0), 5, tipLength=0.3)
+            cv2.putText(display_frame, "EXITING", (w - 170, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 200, 0), 2)
 
         # Trigger snapshot upload if cooldown has passed
         if direction:
             if (current_time - last_capture_time) > CAPTURE_COOLDOWN:
                 last_capture_time = current_time
-                print(f"\n[EVENT] {last_status_msg}")
+                print(f"\n[EVENT] 🚀 {last_status_msg}")
 
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
                 filename = f"{ZONE.replace(' ', '')}_{direction}_{timestamp}.jpg"
@@ -484,22 +547,30 @@ def main():
                 # Save the highest-resolution buffered frame (vehicle closest to camera)
                 upload_frame = best_vehicle_frame if best_vehicle_frame is not None else frame
                 cv2.imwrite(save_path, upload_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-                print(f"[Event] Captured best snapshot saved: {filename} (Contour Area: {max_tracked_area})")
+                print(f"[Event] Best snapshot saved: {filename} (Area: {max_tracked_area})")
                 upload_queue.put(filename)
 
             # Reset trajectory and buffer after event
             trajectory = []
             best_vehicle_frame = None
             max_tracked_area = 0
+            top_cross_down_time = 0
+            bottom_cross_down_time = 0
+            bottom_cross_up_time = 0
+            top_cross_up_time = 0
 
         # Clear expired triggers (> 4 seconds)
-        if current_time - top_trigger_time > 4.0:
-            top_trigger_time = 0
-        if current_time - bottom_trigger_time > 4.0:
-            bottom_trigger_time = 0
+        if current_time - top_cross_down_time > 4.0:
+            top_cross_down_time = 0
+        if current_time - bottom_cross_down_time > 4.0:
+            bottom_cross_down_time = 0
+        if current_time - bottom_cross_up_time > 4.0:
+            bottom_cross_up_time = 0
+        if current_time - top_cross_up_time > 4.0:
+            top_cross_up_time = 0
 
-        # If both tripwires idle and trajectory empty, reset best frame buffer
-        if top_trigger_time == 0 and bottom_trigger_time == 0 and len(trajectory) == 0:
+        # If idle, reset best frame buffer
+        if len(trajectory) == 0 and top_cross_down_time == 0 and bottom_cross_up_time == 0:
             best_vehicle_frame = None
             max_tracked_area = 0
 
