@@ -363,14 +363,16 @@ async def main_scheduler():
     start_dt = datetime.combine(TARGET_DATE, START_TIME)
     end_dt = datetime.combine(TARGET_DATE, END_TIME)
 
-    # 1. Wait until 10:00 AM if started early
-    if now < start_dt:
-        wait_seconds = (start_dt - now).total_seconds()
-        hours = int(wait_seconds // 3600)
-        minutes = int((wait_seconds % 3600) // 60)
-        print(f"\n⏰ Standing by until 10:00 AM ({hours}h {minutes}m remaining)...")
-        print("The daemon will automatically wake up and activate at exactly 10:00:00 AM.")
-        await asyncio.sleep(wait_seconds)
+    # 1. Wait until 10:00 AM if started early (sleep-resilient periodic check)
+    last_print = 0
+    while datetime.now() < start_dt:
+        diff = (start_dt - datetime.now()).total_seconds()
+        hours = int(diff // 3600)
+        minutes = int((diff % 3600) // 60)
+        if time.time() - last_print > 300 or last_print == 0:
+            print(f"[Standby] ⏰ Waiting for 10:00 AM session ({hours}h {minutes}m remaining)...")
+            last_print = time.time()
+        await asyncio.sleep(min(10, max(1, diff)))
 
     # 2. Activate Active Benchmark Window (10:00 AM - 12:00 PM)
     print("\n" + "#"*70)
@@ -380,14 +382,14 @@ async def main_scheduler():
 
     ws_task = asyncio.create_task(monitor_traffic_websocket(session))
 
-    # Calculate run duration until 12:00 PM
-    now = datetime.now()
-    if now < end_dt:
-        run_duration = (end_dt - now).total_seconds()
-        print(f"[Benchmark] Active recording for {run_duration / 60:.1f} minutes until 12:00 PM...")
-        await asyncio.sleep(run_duration)
-    else:
-        print("[Benchmark] Current time is past 12:00 PM. Processing captured dataset immediately...")
+    # Dynamic loop until 12:00 PM
+    last_status = 0
+    while datetime.now() < end_dt:
+        diff = (end_dt - datetime.now()).total_seconds()
+        if time.time() - last_status > 600 or last_status == 0:
+            print(f"[Benchmark] 📊 Active recording in progress ({diff / 60:.1f} minutes remaining until 12:00 PM)...")
+            last_status = time.time()
+        await asyncio.sleep(min(10, max(1, diff)))
 
     # 3. Stop session and export reports
     session.running = False
