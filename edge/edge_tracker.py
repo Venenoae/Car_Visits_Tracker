@@ -21,7 +21,7 @@ WEB_STREAM_PORT = 8080                          # Port to view live feed in brow
 # where the Nissan Patrol is parked so staff walking near it produce ZERO motion triggers!
 # Right limit (x=0.85 / ~1080px): Cuts off far right wall/column.
 DETECTION_X_MIN = 0.29
-DETECTION_X_MAX = 0.85
+DETECTION_X_MAX = 0.95
 
 # Vertical Corridor:
 # TOP LIMIT (y=0.18 / ~130px): Cuts off distant highway/street traffic through outer glass.
