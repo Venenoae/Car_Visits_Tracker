@@ -407,9 +407,12 @@ def run_ai_pipeline(image_path: str):
                 if y2 < 330:
                     continue
 
-                # 2. Sideline Filter:
-                #    Ignore parked vehicles on far sides outside the driveway (x1 > 1100 or x2 < 120)
-                if x1 > 1100 or x2 < 120:
+                # 2. Driveway Lane Corridor Filter (New Camera Position Calibration):
+                #    A vehicle must be in the active sliding-door driveway lane.
+                #    Completely ignores the parked Nissan Patrol and showroom floor on the left (cx < 380 or x2 < 380).
+                #    Ignores far-right wall / column (cx > 1060 or x1 > 1050).
+                cx = (x1 + x2) // 2
+                if cx < 380 or cx > 1060 or x2 < 380 or x1 > 1050:
                     continue
 
                 # 3. Minimum vehicle dimensions in entryway

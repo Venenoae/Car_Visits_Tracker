@@ -15,23 +15,32 @@ ZONE = "Zone A"                                  # 'Zone A' (Ground) or 'Zone B'
 CAMERA_INDEX = 0                                # 0 is standard for Logitech USB webcam
 WEB_STREAM_PORT = 8080                          # Port to view live feed in browser
 
+# 🚗 ACTIVE DRIVEWAY CORRIDOR & PARKING MASK (New Camera Position Calibration)
+# Horizontal Corridor:
+# Left limit (x=0.29 / ~370px): Completely masks out the left showroom parking bay
+# where the Nissan Patrol is parked so staff walking near it produce ZERO motion triggers!
+# Right limit (x=0.85 / ~1080px): Cuts off far right wall/column.
+DETECTION_X_MIN = 0.29
+DETECTION_X_MAX = 0.85
+
+# Vertical Corridor:
+# TOP LIMIT (y=0.18 / ~130px): Cuts off distant highway/street traffic through outer glass.
+# BOTTOM LIMIT (y=0.68 / ~490px): Cuts off indoor showroom walking floor.
+DETECTION_Y_MIN = 0.18
+DETECTION_Y_MAX = 0.68
+
 # Virtual Tripwires calibrated for outside ramp to indoor bay (percentages of frame height)
 # TOP LINE: Outer ramp / glass door sill
-TRIPWIRE_TOP_Y = 0.34
+TRIPWIRE_TOP_Y = 0.30
 # BOTTOM LINE: Indoor bay floor where car enters and stops
 TRIPWIRE_BOTTOM_Y = 0.52
 
-# Detection corridor:
-# From top ramp (y=0.18) down to car stop position (y=0.65). 
-# Anything below y=0.65 is staff walking floor and is completely masked out.
-DETECTION_Y_MIN = 0.18
-DETECTION_Y_MAX = 0.65
-
-# Contour area and width for distant cars outside (15-20 meters away through glass)
-MIN_CONTOUR_AREA = 3200
-MIN_VEHICLE_WIDTH = 75
-CAPTURE_COOLDOWN = 0.8  # Rapid 0.8s burst for convoy & door-opening entry captures
-CACHE_MAX_AGE_DAYS = 2  # Discard cached frames older than 2 days to protect SD card storage
+# Contour area and width for vehicles
+MIN_CONTOUR_AREA = 3500
+MIN_VEHICLE_WIDTH = 80
+MIN_CENTROID_DISPLACEMENT = 70  # Vehicle must physically translate >= 70px to trigger
+CAPTURE_COOLDOWN = 1.0          # 1.0s debounce between trigger uploads
+CACHE_MAX_AGE_DAYS = 2          # Discard cached frames older than 2 days to protect SD card storage
 
 # Local cache directory for offline resilience
 CACHE_DIR = os.path.join(os.path.dirname(__file__), "cache")
@@ -354,13 +363,19 @@ def main():
         y_bottom = int(h * TRIPWIRE_BOTTOM_Y)
         y_roi_min = int(h * DETECTION_Y_MIN)
         y_roi_max = int(h * DETECTION_Y_MAX)
+        x_lane_min = int(w * DETECTION_X_MIN)
+        x_lane_max = int(w * DETECTION_X_MAX)
 
-        # 1. Mask out indoor showroom floor where staff walk and distant sky
+        # 1. Driveway Spatial Masking:
+        # Zero out the left showroom parking bay (where the Nissan Patrol sits and staff walk),
+        # the right wall/column, the distant street, and the foreground indoor floor.
         motion_frame = frame.copy()
         motion_frame[:y_roi_min, :] = 0
         motion_frame[y_roi_max:, :] = 0
+        motion_frame[:, :x_lane_min] = 0
+        motion_frame[:, x_lane_max:] = 0
 
-        # 2. Background Subtraction focused exclusively on outside driveway/ramp
+        # 2. Background Subtraction focused exclusively on active sliding-door driveway
         fg_mask = back_sub.apply(motion_frame)
         _, thresh = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
@@ -373,22 +388,37 @@ def main():
         # Create display copy with annotations for live preview
         display_frame = frame.copy()
 
-        # Draw Outdoor Street & Ramp Detection Corridor with active status
+        # Draw Dimmed Left Showroom Bay Overlay (Shows where movement is 100% ignored)
+        overlay = display_frame.copy()
+        cv2.rectangle(overlay, (0, 0), (x_lane_min, h), (20, 20, 20), -1)
+        cv2.rectangle(overlay, (x_lane_max, 0), (w, h), (20, 20, 20), -1)
+        cv2.addWeighted(overlay, 0.40, display_frame, 0.60, 0, display_frame)
+
+        cv2.line(display_frame, (x_lane_min, 0), (x_lane_min, h), (0, 165, 255), 2)
+        cv2.putText(display_frame, "[SHOWROOM BAY MASKED]", (15, int(h * 0.45)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (140, 140, 140), 1)
+
+        # Active Driveway Lane HUD
+        cv2.rectangle(display_frame, (x_lane_min, y_roi_min), (x_lane_max, y_roi_max), (0, 255, 255), 1)
+        cv2.putText(display_frame, f"ACTIVE DRIVEWAY LANE [{int(DETECTION_X_MIN*100)}%-{int(DETECTION_X_MAX*100)}%]",
+                    (x_lane_min + 10, y_roi_min - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+        # Draw Tripwires across active driveway lane
         top_color = (0, 0, 255) if (current_time - top_cross_down_time < 1.5 or current_time - top_cross_up_time < 1.5) else (0, 100, 255)
         bot_color = (0, 255, 0) if (current_time - bottom_cross_down_time < 1.5 or current_time - bottom_cross_up_time < 1.5) else (0, 200, 100)
 
-        cv2.line(display_frame, (0, y_top), (w, y_top), top_color, 2)
-        cv2.putText(display_frame, f"TRIPWIRE TOP (Ramp / Street) [{int(TRIPWIRE_TOP_Y*100)}%]", (20, y_top - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, top_color, 2)
+        cv2.line(display_frame, (x_lane_min, y_top), (x_lane_max, y_top), top_color, 2)
+        cv2.putText(display_frame, f"TRIPWIRE TOP (Ramp / Street) [{int(TRIPWIRE_TOP_Y*100)}%]", (x_lane_min + 10, y_top - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, top_color, 2)
 
-        cv2.line(display_frame, (0, y_bottom), (w, y_bottom), bot_color, 2)
-        cv2.putText(display_frame, f"TRIPWIRE BOTTOM (Gate Threshold) [{int(TRIPWIRE_BOTTOM_Y*100)}%]", (20, y_bottom - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, bot_color, 2)
+        cv2.line(display_frame, (x_lane_min, y_bottom), (x_lane_max, y_bottom), bot_color, 2)
+        cv2.putText(display_frame, f"TRIPWIRE BOTTOM (Gate Threshold) [{int(TRIPWIRE_BOTTOM_Y*100)}%]", (x_lane_min + 10, y_bottom - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, bot_color, 2)
 
         # Masked Floor Indicator
-        cv2.line(display_frame, (0, y_roi_max), (w, y_roi_max), (100, 100, 100), 1)
-        cv2.putText(display_frame, "[INDOOR FLOOR MASKED OUT - PEDESTRIANS IGNORED]", (20, y_roi_max + 24),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (140, 140, 140), 1)
+        cv2.line(display_frame, (x_lane_min, y_roi_max), (x_lane_max, y_roi_max), (100, 100, 100), 1)
+        cv2.putText(display_frame, "[INDOOR FLOOR MASKED OUT - PEDESTRIANS IGNORED]", (x_lane_min + 10, y_roi_max + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (140, 140, 140), 1)
 
         largest_area_this_frame = 0
         vehicle_box = None
@@ -400,8 +430,10 @@ def main():
 
             x, y, bw, bh = cv2.boundingRect(contour)
 
-            # Ignore contours spanning outside the outdoor ROI
+            # Ignore contours spanning outside the active driveway corridor
             if (y + bh) > (y_roi_max + 20) or y < (y_roi_min - 20):
+                continue
+            if (x + bw) > (x_lane_max + 20) or x < (x_lane_min - 20):
                 continue
 
             # Pedestrian filter: narrow upright contours
@@ -545,7 +577,18 @@ def main():
             cv2.arrowedLine(display_frame, (w - 100, 160), (w - 100, 60), (255, 200, 0), 5, tipLength=0.3)
             cv2.putText(display_frame, "EXITING", (w - 170, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 200, 0), 2)
 
-        # Trigger snapshot upload if cooldown has passed
+        # Trigger snapshot upload if cooldown has passed and vehicle physically moved
+        if direction:
+            # Centroid Displacement Validation: ensure vehicle moved >= MIN_CENTROID_DISPLACEMENT
+            # Rejects stationary showroom cars with staff walking past them!
+            total_disp = 0
+            if len(trajectory) >= 2:
+                total_disp = abs(trajectory[-1][2] - trajectory[0][2])
+
+            if total_disp < MIN_CENTROID_DISPLACEMENT and len(trajectory) >= 4:
+                direction = None
+                last_status_msg = f"Stationary Car Activity Ignored (Displacement {int(total_disp)}px < {MIN_CENTROID_DISPLACEMENT}px)"
+
         if direction:
             if (current_time - last_capture_time) > CAPTURE_COOLDOWN:
                 last_capture_time = current_time

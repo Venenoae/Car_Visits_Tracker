@@ -348,28 +348,31 @@ async def process_capture_background(
                         recent_provisional.entry_image_url = relative_img_url
                         visit = recent_provisional
 
-            # 3. Check if duplicate entry for exact plate
+            # 3. Check if vehicle is already marked 'Inside' (In-facility activity suppression)
             if not visit:
                 active_visit = db.query(Visit).filter(Visit.plate_number == plate, Visit.status == "Inside").first()
                 if active_visit:
                     time_diff = (current_time - active_visit.entry_timestamp).total_seconds()
-                    if time_diff < 40:
+                    if time_diff < 60:
                         # Vehicle crossing gate hesitation: refresh snapshot
+                        print(f"[AI Gatekeeper] Entry hesitation for '{plate}' ({time_diff:.1f}s). Refreshing snapshot.")
                         active_visit.entry_image_url = relative_img_url
                         visit = active_visit
                     else:
-                        # Auto-close previous visit and start fresh entry (useful for testing and re-entries)
-                        active_visit.status = "Completed"
-                        active_visit.exit_timestamp = current_time
-                        visit = Visit(
-                            plate_number=plate,
-                            zone=zone,
-                            entry_timestamp=current_time,
-                            entry_image_url=relative_img_url,
-                            status="Inside"
-                        )
-                        db.add(visit)
+                        # Vehicle is ALREADY Inside the showroom! Staff washing/moving/inspecting is internal workshop activity.
+                        print(f"[AI Gatekeeper] ℹ️ Vehicle '{plate}' is already marked 'Inside' ({time_diff:.1f}s ago). In-facility motion suppressed.")
+                        db.close()
+                        return
                 else:
+                    # Check departure debounce: If vehicle just exited within 2 minutes, do not immediately re-enter unless confirmed
+                    recent_exit = db.query(Visit).filter(Visit.plate_number == plate, Visit.status == "Completed").order_by(Visit.exit_timestamp.desc()).first()
+                    if recent_exit and recent_exit.exit_timestamp:
+                        time_since_exit = (current_time - recent_exit.exit_timestamp).total_seconds()
+                        if time_since_exit < 120:
+                            print(f"[AI Gatekeeper] Vehicle '{plate}' exited only {time_since_exit:.1f}s ago. Inward hesitation/maneuver suppressed.")
+                            db.close()
+                            return
+
                     # Create new visit record
                     visit = Visit(
                         plate_number=plate,
@@ -381,7 +384,46 @@ async def process_capture_background(
                     db.add(visit)
 
         else:  # Direction is "Exit"
-            # 1. Look for exact match first
+            # Departure Debounce Guard (3-Minute Lockout):
+            # Check if this vehicle ALREADY completed an exit in the last 3 minutes (180s)
+            recent_completed = db.query(Visit).filter(
+                Visit.plate_number == plate,
+                Visit.status == "Completed"
+            ).order_by(Visit.exit_timestamp.desc()).first()
+
+            if recent_completed and recent_completed.exit_timestamp:
+                time_since_exit = (current_time - recent_completed.exit_timestamp).total_seconds()
+                if time_since_exit < 180:
+                    print(f"[AI Lifecycle] 🚗 Vehicle '{plate}' stopped/maneuvering at exit ({time_since_exit:.1f}s after exit). Updating departure snapshot, suppressing duplicate visit.")
+                    recent_completed.exit_image_url = relative_img_url
+                    visit = recent_completed
+                    db.commit()
+                    db.refresh(visit)
+                    ws_payload = {
+                        "event_type": "VISIT_UPDATE",
+                        "scan_id": scan_id,
+                        "visit": {
+                            "id": visit.id,
+                            "plate_number": vehicle.plate_number,
+                            "color": vehicle.color,
+                            "brand": vehicle.brand,
+                            "owner_name": vehicle.owner_name,
+                            "owner_phone": vehicle.owner_phone,
+                            "zone": visit.zone,
+                            "entry_timestamp": visit.entry_timestamp.isoformat() if visit.entry_timestamp else None,
+                            "exit_timestamp": visit.exit_timestamp.isoformat() if visit.exit_timestamp else None,
+                            "status": visit.status,
+                            "entry_image_url": visit.entry_image_url,
+                            "exit_image_url": visit.exit_image_url,
+                            "manually_created": visit.manually_created,
+                            "manually_edited": visit.manually_edited
+                        }
+                    }
+                    await manager.broadcast(ws_payload)
+                    db.close()
+                    return
+
+            # 1. Look for exact active 'Inside' match first
             visit = db.query(Visit).filter(Visit.plate_number == plate, Visit.status == "Inside").order_by(Visit.entry_timestamp.desc()).first()
 
             # 2. Fuzzy match fallback: allow minor OCR variations (e.g. 551913 vs 51913 or 519131)
@@ -421,8 +463,13 @@ async def process_capture_background(
                 vehicle = db.query(Vehicle).filter(Vehicle.plate_number == visit.plate_number).first() or vehicle
             else:
                 # Existing workshop car test mode:
-                # The car was already inside before the tracking system started.
-                # Record it as a completed exit and count it!
+                # Check if this exact plate had an exit in the last 15 minutes before creating a fresh completed visit
+                prev_exit = db.query(Visit).filter(Visit.plate_number == plate, Visit.status == "Completed").order_by(Visit.exit_timestamp.desc()).first()
+                if prev_exit and prev_exit.exit_timestamp and (current_time - prev_exit.exit_timestamp).total_seconds() < 900:
+                    print(f"[AI Lifecycle] ℹ️ Car '{plate}' already exited previously. Suppressing duplicate exit.")
+                    db.close()
+                    return
+
                 print(f"[Testing Mode] Car '{plate}' exited without prior entry log. Recording exit visit.")
                 visit = Visit(
                     plate_number=plate,
