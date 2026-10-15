@@ -470,15 +470,15 @@ async def process_capture_background(
                     db.close()
                     return
 
-                print(f"[Testing Mode] Car '{plate}' exited without prior entry log. Recording exit visit.")
+                print(f"[AI Influx] Car '{plate}' arrived at gate without active visit. Recording as active Inside visit.")
                 visit = Visit(
                     plate_number=plate,
                     zone=zone,
                     entry_timestamp=current_time,
-                    exit_timestamp=current_time,
-                    entry_image_url=None,
-                    exit_image_url=relative_img_url,
-                    status="Completed",
+                    exit_timestamp=None,
+                    entry_image_url=relative_img_url,
+                    exit_image_url=None,
+                    status="Inside",
                     manually_created=False
                 )
                 db.add(visit)

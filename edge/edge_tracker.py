@@ -459,6 +459,21 @@ def main():
             x, y, bw, bh = vehicle_box
             cx = x + (bw // 2)
             cy = y + (bh // 2)
+
+            # Spatial Continuity Check:
+            # If the detected centroid suddenly jumps > 90px from the previous point,
+            # it is a different physical object (e.g. staff walking in showroom vs car entering from ramp)!
+            if len(trajectory) > 0:
+                last_time, last_cx, last_cy, _, _, _ = trajectory[-1]
+                dist = ((cx - last_cx)**2 + (cy - last_cy)**2) ** 0.5
+                if dist > 90 and (current_time - last_time) < 0.5:
+                    trajectory = []
+                    prev_cy = None
+                    top_cross_down_time = 0
+                    bottom_cross_down_time = 0
+                    bottom_cross_up_time = 0
+                    top_cross_up_time = 0
+
             trajectory.append((current_time, cx, cy, largest_area_this_frame, bw, bh))
 
             # Centroid tripwire crossings (precise point-crossing avoids multi-line overlap)
