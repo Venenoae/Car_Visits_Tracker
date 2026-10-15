@@ -451,31 +451,30 @@ def run_ai_pipeline(image_path: str):
             # Vehicle Classes: car (2), motorcycle (3), bus (5), truck (7)
             if cls_id in [2, 3, 5, 7] and conf >= 0.35:
                 # Active Gate Corridor Gatekeeper:
-                # 1. Distant Parked Vehicle Filter:
-                #    A vehicle entering/exiting the gate MUST reach the entryway threshold (y2 >= 330).
-                #    Vehicles strictly above y2 < 330 are parked outside on the street/ramp and must be ignored.
-                if y2 < 330:
+                # 1. Distant Ramp Filter:
+                #    Vehicles approaching the gate must be at y2 >= 270.
+                if y2 < 270:
                     continue
 
-                # 2. Driveway Lane Corridor Filter (New Camera Position Calibration):
+                # 2. Driveway Lane Corridor Filter (Calibrated to User Drawn Box):
                 #    A vehicle must be in the active sliding-door driveway lane.
-                #    Completely ignores the parked showroom bay on the left (x1 < 250 and (x2 < 900 or cx < 550)).
-                #    Right lane calibrated to DETECTION_X_MAX = 0.95 (~1216px).
+                #    Ignores the parked showroom bay on the left (x1 < 220 and (x2 < 850 or cx < 500)).
+                #    Right lane calibrated to DETECTION_X_MAX = 0.97 (~1240px).
                 cx = (x1 + x2) // 2
-                if x1 < 250 and (x2 < 900 or cx < 550):
+                if x1 < 220 and (x2 < 850 or cx < 500):
                     continue
-                if cx < 380 or cx > 1200 or x2 < 380 or x1 > 1180:
+                if cx < 320 or cx > 1250 or x2 < 320 or x1 > 1245:
                     continue
 
                 # 3. Minimum vehicle dimensions in entryway
-                if bw >= 220 and bh >= 140:
+                if bw >= 200 and bh >= 130:
                     score = conf * (area ** 0.5)
                     candidate_vehicles.append((score, area, bw, bh, [x1, y1, x2, y2]))
 
     # If NO vehicle is in the active gate corridor, ignore the capture entirely
     if not candidate_vehicles:
         if has_foreground_person:
-            print("[AI] 🚶 Pedestrian / staff motion detected at gate. Ignored.")
+            print("[AI] 🚶 Pedestrian / staff motion detected at gate with no vehicle. Ignored.")
             return {
                 "success": False,
                 "vehicle_detected": False,
@@ -538,7 +537,7 @@ def run_ai_pipeline(image_path: str):
             "quality_score": 100.0 + (25.0 if brand != "Unknown" else 0.0) + (10.0 if color != "Unknown" else 0.0)
         }
 
-    # If no readable plate, only allow UNREADABLE visit if a massive vehicle physically occupies the entryway
+    # If no readable plate, check if a qualifying vehicle is physically occupying the active entryway
     top_score, top_area, top_bw, top_bh, top_box = candidate_vehicles[0]
     person_blocking_car = False
     if has_foreground_person and person_box:
@@ -546,28 +545,16 @@ def run_ai_pipeline(image_path: str):
         cx1, cy1, cx2, cy2 = top_box
         overlap_x = max(0, min(px2, cx2) - max(px1, cx1))
         car_w = cx2 - cx1
-        if car_w > 0 and (overlap_x / car_w) > 0.45:
+        if car_w > 0 and (overlap_x / car_w) > 0.65:
             person_blocking_car = True
 
-    # If a foreground person is present and no plate was read, it is staff activity near a car
-    if has_foreground_person:
-        print("[AI] 🚶 Pedestrian / staff motion in gate area with no readable plate. Ignored to prevent false visit.")
-        return {
-            "success": False,
-            "vehicle_detected": False,
-            "plate": "UNKNOWN",
-            "color": "Unknown",
-            "brand": "Unknown",
-            "coords": [0, 0, 0, 0],
-            "message": "Pedestrian / staff motion in gate (ignored)"
-        }
-
-    if top_bw >= 280 and top_bh >= 180 and top_area >= 45000 and not person_blocking_car:
+    # Substantial vehicle in gate: accept even if staff is guiding it or plate is shadowed
+    if top_bw >= 200 and top_bh >= 130 and top_area >= 30000 and top_box[3] >= 310 and not person_blocking_car:
         x1, y1, x2, y2 = top_box
         crop = img[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
         color = classify_color(crop)
         brand = classify_brand(crop)
-        print(f"[AI] ⚠️ Gate vehicle detected, but plate unreadable ({color}, {brand}). Manual review available.")
+        print(f"[AI] ⚠️ Gate vehicle detected, but plate unreadable ({color}, {brand}). Staff present: {has_foreground_person}. Recorded for review.")
         centering_bonus = 15.0 if (380 <= top_box[3] <= 620) else 0.0
         return {
             "success": False,
@@ -578,6 +565,19 @@ def run_ai_pipeline(image_path: str):
             "coords": [int(c) for c in top_box],
             "quality_score": 40.0 + (20.0 if brand != "Unknown" else 0.0) + centering_bonus,
             "message": "Vehicle in gate, but license plate is unreadable or obscured."
+        }
+
+    # If a foreground person is present and no substantial car is in the entryway, ignore as pedestrian activity
+    if has_foreground_person:
+        print("[AI] 🚶 Pedestrian / staff motion in gate area with no gate vehicle. Ignored.")
+        return {
+            "success": False,
+            "vehicle_detected": False,
+            "plate": "UNKNOWN",
+            "color": "Unknown",
+            "brand": "Unknown",
+            "coords": [0, 0, 0, 0],
+            "message": "Pedestrian / staff motion in gate (ignored)"
         }
 
     # Smaller / partial or ambiguous objects with unreadable plate are safely ignored

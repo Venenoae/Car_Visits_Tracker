@@ -15,25 +15,24 @@ ZONE = "Zone A"                                  # 'Zone A' (Ground) or 'Zone B'
 CAMERA_INDEX = 0                                # 0 is standard for Logitech USB webcam
 WEB_STREAM_PORT = 8080                          # Port to view live feed in browser
 
-# 🚗 ACTIVE DRIVEWAY CORRIDOR & PARKING MASK (New Camera Position Calibration)
+# 🚗 ACTIVE DRIVEWAY CORRIDOR & PARKING MASK (Calibrated to User Drawn Box)
 # Horizontal Corridor:
-# Left limit (x=0.29 / ~370px): Completely masks out the left showroom parking bay
-# where the Nissan Patrol is parked so staff walking near it produce ZERO motion triggers!
-# Right limit (x=0.85 / ~1080px): Cuts off far right wall/column.
-DETECTION_X_MIN = 0.25
-DETECTION_X_MAX = 0.95
+# Left limit (x=0.22 / ~280px): Masks out the left showroom parking bay (Nissan Patrol)
+# Right limit (x=0.97 / ~1240px): Covers the right ramp all the way to the far right wall/glass
+DETECTION_X_MIN = 0.22
+DETECTION_X_MAX = 0.97
 
 # Vertical Corridor:
-# TOP LIMIT (y=0.18 / ~130px): Cuts off distant highway/street traffic through outer glass.
-# BOTTOM LIMIT (y=0.68 / ~490px): Cuts off indoor showroom walking floor.
+# TOP LIMIT (y=0.22 / ~158px): Cuts off distant highway/street traffic through outer glass.
+# BOTTOM LIMIT (y=0.70 / ~504px): Extends across indoor showroom bay floor.
 DETECTION_Y_MIN = 0.22
-DETECTION_Y_MAX = 0.68
+DETECTION_Y_MAX = 0.70
 
 # Virtual Tripwires calibrated for outside ramp to indoor bay (percentages of frame height)
-# TOP LINE: Outer ramp / glass door sill
-TRIPWIRE_TOP_Y = 0.30
-# BOTTOM LINE: Indoor bay floor where car enters and stops
-TRIPWIRE_BOTTOM_Y = 0.52
+# TOP LINE: Outer ramp entrance (drawn by user across glass door lower section)
+TRIPWIRE_TOP_Y = 0.35
+# BOTTOM LINE: Indoor showroom floor threshold (drawn by user across floor tiles)
+TRIPWIRE_BOTTOM_Y = 0.54
 
 # Contour area and width for vehicles
 MIN_CONTOUR_AREA = 3500
@@ -522,22 +521,20 @@ def main():
         latest_bw = vehicle_box[2] if vehicle_box is not None else 0
 
         # 1. Centroid Sequential Tripwires
-        # Top -> Down crossing within 0.3s - 3.5s = ENTRY
-        # Strictest requirement: Entry MUST originate from outside the ramp (start_cy <= y_top + 25)
-        # and vehicle must have substantial width (>= 130px)
+        # Top -> Down crossing within 0.3s - 4.0s = ENTRY
         if top_cross_down_time > 0 and bottom_cross_down_time > 0:
-            if top_cross_down_time < bottom_cross_down_time and (bottom_cross_down_time - top_cross_down_time) < 3.5:
-                if start_cy is None or start_cy <= (y_top + 25):
+            if top_cross_down_time < bottom_cross_down_time and (bottom_cross_down_time - top_cross_down_time) < 4.0:
+                if start_cy is None or start_cy <= (y_bottom - 15):
                     direction = "Entry"
                     last_status_msg = "Top-to-Bottom Ramp Crossing -> ENTRY (Check-In)"
                 else:
                     last_status_msg = "Indoor Motion Ignored (Did not originate from outside ramp)"
                 top_cross_down_time = 0
                 bottom_cross_down_time = 0
-        # Bottom -> Top crossing within 0.3s - 3.5s = EXIT
+        # Bottom -> Top crossing within 0.3s - 4.0s = EXIT
         elif bottom_cross_up_time > 0 and top_cross_up_time > 0:
-            if bottom_cross_up_time < top_cross_up_time and (top_cross_up_time - bottom_cross_up_time) < 3.5:
-                if start_cy is None or start_cy >= (y_bottom - 25):
+            if bottom_cross_up_time < top_cross_up_time and (top_cross_up_time - bottom_cross_up_time) < 4.0:
+                if start_cy is None or start_cy >= (y_top + 15):
                     direction = "Exit"
                     last_status_msg = "Bottom-to-Top Ramp Crossing -> EXIT (Check-Out)"
                 else:
@@ -546,9 +543,9 @@ def main():
                 top_cross_up_time = 0
 
         # 2. Continuous 2D Motion Vector + Perspective Scale Factor (Fallback / Real-Time)
-        if direction is None and len(trajectory) >= 6:
+        if direction is None and len(trajectory) >= 5:
             dt = trajectory[-1][0] - trajectory[0][0]
-            if dt >= 0.28:
+            if dt >= 0.25:
                 # Compare average of first 3 points vs last 3 points for smooth vector
                 start_pts = trajectory[:3]
                 end_pts = trajectory[-3:]
@@ -565,22 +562,22 @@ def main():
                 dy = end_cy - s_cy
                 area_ratio = end_area / max(s_area, 1.0)
 
-                # Filter out horizontal street cross-traffic
-                if abs(dx) > (abs(dy) * 1.3) and abs(dx) > 40:
+                # Pure horizontal motion check: ONLY ignore if dy has negligible vertical progress (|dy| < 15) and near top border
+                if abs(dy) < 15 and abs(dx) > 50 and s_cy < (y_top + 15):
                     last_status_msg = "Street Cross Traffic Ignored (Horizontal)"
                 else:
-                    # Vertical motion down ramp / driveway
-                    if dy > 30 and (s_cy <= y_top + 25):
+                    # Inward motion down ramp / driveway towards showroom
+                    if dy >= 25 and s_cy <= (y_bottom - 15):
                         # Moving Top -> Down (Approaching from outside)
                         current_direction_hint = "Entry"
-                        if (top_cross_down_time > 0) or (area_ratio >= 1.05 and end_cy >= (y_bottom - 20)):
+                        if (top_cross_down_time > 0) or (end_cy >= y_top and (area_ratio >= 1.02 or dy >= 35)):
                             direction = "Entry"
                             last_status_msg = f"Ramp Inward Vector (dy=+{int(dy)}px, scale={area_ratio:.2f}) -> ENTRY"
 
-                    elif dy < -30 and (s_cy >= y_bottom - 25):
+                    elif dy <= -25 and s_cy >= (y_top + 15):
                         # Moving Down -> Top (Leaving from inside bay)
                         current_direction_hint = "Exit"
-                        if (bottom_cross_up_time > 0) or (area_ratio <= 0.95 and end_cy <= (y_top + 20)):
+                        if (bottom_cross_up_time > 0) or (end_cy <= y_bottom and (area_ratio <= 0.98 or dy <= -35)):
                             direction = "Exit"
                             last_status_msg = f"Ramp Outward Vector (dy={int(dy)}px, scale={area_ratio:.2f}) -> EXIT"
 
