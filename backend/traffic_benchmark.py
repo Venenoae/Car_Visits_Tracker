@@ -29,18 +29,18 @@ WS_URL = "ws://127.0.0.1:8000/ws"
 
 os.makedirs(REPORTS_DIR, exist_ok=True)
 
-# Test Window Configuration: 10:00 AM to 12:00 PM
+# Test Window Configuration: 10:10 AM to 12:10 PM
 TARGET_DATE = date(2026, 10, 15)
-START_TIME = dtime(10, 0, 0)
-END_TIME = dtime(12, 0, 0)
+START_TIME = dtime(10, 10, 0)
+END_TIME = dtime(12, 10, 0)
 
 
 class TrafficBenchmarkSession:
     def __init__(self):
         self.session_data = {
             "session_date": str(TARGET_DATE),
-            "start_time": "10:00:00",
-            "end_time": "12:00:00",
+            "start_time": "10:10:00",
+            "end_time": "12:10:00",
             "events": [],
             "stats": {
                 "total_events": 0,
