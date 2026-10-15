@@ -459,9 +459,11 @@ def run_ai_pipeline(image_path: str):
 
                 # 2. Driveway Lane Corridor Filter (New Camera Position Calibration):
                 #    A vehicle must be in the active sliding-door driveway lane.
-                #    Completely ignores the parked Nissan Patrol and showroom floor on the left (cx < 380 or x2 < 380).
+                #    Completely ignores the parked showroom bay on the left (x1 < 250 and (x2 < 900 or cx < 550)).
                 #    Right lane calibrated to DETECTION_X_MAX = 0.95 (~1216px).
                 cx = (x1 + x2) // 2
+                if x1 < 250 and (x2 < 900 or cx < 550):
+                    continue
                 if cx < 380 or cx > 1200 or x2 < 380 or x1 > 1180:
                     continue
 
@@ -546,6 +548,19 @@ def run_ai_pipeline(image_path: str):
         car_w = cx2 - cx1
         if car_w > 0 and (overlap_x / car_w) > 0.45:
             person_blocking_car = True
+
+    # If a foreground person is present and no plate was read, it is staff activity near a car
+    if has_foreground_person:
+        print("[AI] 🚶 Pedestrian / staff motion in gate area with no readable plate. Ignored to prevent false visit.")
+        return {
+            "success": False,
+            "vehicle_detected": False,
+            "plate": "UNKNOWN",
+            "color": "Unknown",
+            "brand": "Unknown",
+            "coords": [0, 0, 0, 0],
+            "message": "Pedestrian / staff motion in gate (ignored)"
+        }
 
     if top_bw >= 280 and top_bh >= 180 and top_area >= 45000 and not person_blocking_car:
         x1, y1, x2, y2 = top_box
