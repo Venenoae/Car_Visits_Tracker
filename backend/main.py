@@ -229,7 +229,7 @@ async def process_capture_background(
             from database import SessionLocal, Vehicle, Visit
             db_check = SessionLocal()
             try:
-                current_chk = datetime.utcnow()
+                current_chk = datetime.now()
                 recent_gate_visit = db_check.query(Visit).filter(
                     Visit.zone == zone,
                     Visit.status == "Inside"
@@ -290,7 +290,7 @@ async def process_capture_background(
             elif color and color != "Unknown":
                 vehicle.color = color
 
-        current_time = datetime.utcnow()
+        current_time = datetime.now()
         visit = None
 
         if direction == "Entry":
@@ -796,7 +796,7 @@ async def confirm_unverified_exit(
         )
 
     visit.status = "Completed"
-    visit.exit_timestamp = datetime.utcnow()
+    visit.exit_timestamp = datetime.now()
     if req.exit_image_url:
         visit.exit_image_url = req.exit_image_url
     visit.manually_edited = True

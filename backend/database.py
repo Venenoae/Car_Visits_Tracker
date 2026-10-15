@@ -87,7 +87,7 @@ class Visit(Base):
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     plate_number = Column(String(20), ForeignKey("vehicles.plate_number", onupdate="CASCADE"), nullable=False)
     zone = Column(String(10), nullable=False)  # 'Zone A' or 'Zone B'
-    entry_timestamp = Column(DateTime, default=datetime.utcnow)
+    entry_timestamp = Column(DateTime, default=datetime.now)
     exit_timestamp = Column(DateTime, nullable=True)
     entry_image_url = Column(String(255))
     exit_image_url = Column(String(255))
