@@ -30,7 +30,7 @@ DETECTION_Y_MAX = 0.65
 # Contour area and width for distant cars outside (15-20 meters away through glass)
 MIN_CONTOUR_AREA = 3200
 MIN_VEHICLE_WIDTH = 75
-CAPTURE_COOLDOWN = 12
+CAPTURE_COOLDOWN = 0.8  # Rapid 0.8s burst for convoy & door-opening entry captures
 CACHE_MAX_AGE_DAYS = 2  # Discard cached frames older than 2 days to protect SD card storage
 
 # Local cache directory for offline resilience
@@ -551,7 +551,8 @@ def main():
                 last_capture_time = current_time
                 print(f"\n[EVENT] 🚀 {last_status_msg}")
 
-                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                msec = int((current_time % 1) * 1000)
+                timestamp = time.strftime("%Y%m%d_%H%M%S") + f"_{msec:03d}"
                 filename = f"{ZONE.replace(' ', '')}_{direction}_{timestamp}.jpg"
                 save_path = os.path.join(CACHE_DIR, filename)
 

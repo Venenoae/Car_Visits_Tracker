@@ -1,0 +1,14 @@
+{
+  "session_date": "2026-10-15",
+  "start_time": "10:10:00",
+  "end_time": "11:10:00",
+  "events": [],
+  "stats": {
+    "total_events": 0,
+    "entries": 0,
+    "exits": 0,
+    "unreadable_plates": 0,
+    "recognized_plates": 0,
+    "brands_detected": {}
+  }
+}

@@ -225,20 +225,43 @@ async def process_capture_background(
 
         # If vehicle detected on Entry but plate was unreadable/obscured:
         elif direction == "Entry" and ai_results.get("vehicle_detected"):
-            # Check if any vehicle entered this gate within the last 40 seconds (avoid duplicate unreadable visit for same car)
+            # Spatial-Temporal Best-Shot Ingestion:
+            # Check if an existing unreadable visit was recorded within the 8-second burst window
             from database import SessionLocal, Vehicle, Visit
             db_check = SessionLocal()
             try:
                 current_chk = datetime.now()
-                recent_gate_visit = db_check.query(Visit).filter(
+                recent_unreadable = db_check.query(Visit).filter(
                     Visit.zone == zone,
-                    Visit.status == "Inside"
+                    Visit.status == "Inside",
+                    (Visit.plate_number.like("UNREADABLE-%") | Visit.plate_number.like("CAR-%"))
                 ).order_by(Visit.id.desc()).first()
 
-                if recent_gate_visit:
-                    diff_sec = (current_chk - recent_gate_visit.entry_timestamp).total_seconds()
-                    if diff_sec < 40:
-                        print(f"[AI Debounce] Vehicle {recent_gate_visit.plate_number} still in gate ({diff_sec:.1f}s ago). Ignoring duplicate unreadable snapshot.")
+                if recent_unreadable:
+                    diff_sec = (current_chk - recent_unreadable.entry_timestamp).total_seconds()
+                    if diff_sec < 8.0:
+                        print(f"[AI Best-Shot] Burst frame arrived ({diff_sec:.1f}s ago). Refreshing best image for {recent_unreadable.plate_number}.")
+                        recent_unreadable.entry_image_url = relative_img_url
+                        new_brand = ai_results.get("brand")
+                        new_color = ai_results.get("color")
+                        veh = db_check.query(Vehicle).filter(Vehicle.plate_number == recent_unreadable.plate_number).first()
+                        if veh:
+                            if new_brand and new_brand != "Unknown":
+                                veh.brand = new_brand
+                            if new_color and new_color != "Unknown":
+                                veh.color = new_color
+                        db_check.commit()
+                        await manager.broadcast({
+                            "event_type": "SCAN_SUCCESS",
+                            "scan_id": scan_id,
+                            "zone": zone,
+                            "plate": recent_unreadable.plate_number,
+                            "direction": direction,
+                            "color": veh.color if veh else "Unknown",
+                            "brand": veh.brand if veh else "Unknown",
+                            "image_url": relative_img_url,
+                            "timestamp": current_chk.isoformat()
+                        })
                         return
             finally:
                 db_check.close()

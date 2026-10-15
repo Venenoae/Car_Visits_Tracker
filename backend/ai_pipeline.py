@@ -382,6 +382,7 @@ def run_ai_pipeline(image_path: str):
 
     candidate_vehicles = []
     has_foreground_person = False
+    person_box = None
 
     for result in results:
         for box in result.boxes:
@@ -395,6 +396,7 @@ def run_ai_pipeline(image_path: str):
             # Check for person in doorway or foreground
             if cls_id == 0 and y2 > 250:
                 has_foreground_person = True
+                person_box = [x1, y1, x2, y2]
 
             # Vehicle Classes: car (2), motorcycle (3), bus (5), truck (7)
             if cls_id in [2, 3, 5, 7] and conf >= 0.35:
@@ -477,17 +479,28 @@ def run_ai_pipeline(image_path: str):
             "plate": best_plate,
             "color": color,
             "brand": brand,
-            "coords": [int(c) for c in selected_box]
+            "coords": [int(c) for c in selected_box],
+            "quality_score": 100.0 + (25.0 if brand != "Unknown" else 0.0) + (10.0 if color != "Unknown" else 0.0)
         }
 
     # If no readable plate, only allow UNREADABLE visit if a massive vehicle physically occupies the entryway
     top_score, top_area, top_bw, top_bh, top_box = candidate_vehicles[0]
-    if top_bw >= 300 and top_bh >= 200 and top_area >= 50000 and not has_foreground_person:
+    person_blocking_car = False
+    if has_foreground_person and person_box:
+        px1, py1, px2, py2 = person_box
+        cx1, cy1, cx2, cy2 = top_box
+        overlap_x = max(0, min(px2, cx2) - max(px1, cx1))
+        car_w = cx2 - cx1
+        if car_w > 0 and (overlap_x / car_w) > 0.45:
+            person_blocking_car = True
+
+    if top_bw >= 280 and top_bh >= 180 and top_area >= 45000 and not person_blocking_car:
         x1, y1, x2, y2 = top_box
         crop = img[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
         color = classify_color(crop)
         brand = classify_brand(crop)
         print(f"[AI] ⚠️ Gate vehicle detected, but plate unreadable ({color}, {brand}). Manual review available.")
+        centering_bonus = 15.0 if (380 <= top_box[3] <= 620) else 0.0
         return {
             "success": False,
             "vehicle_detected": True,
@@ -495,6 +508,7 @@ def run_ai_pipeline(image_path: str):
             "color": color,
             "brand": brand,
             "coords": [int(c) for c in top_box],
+            "quality_score": 40.0 + (20.0 if brand != "Unknown" else 0.0) + centering_bonus,
             "message": "Vehicle in gate, but license plate is unreadable or obscured."
         }
 
@@ -507,6 +521,7 @@ def run_ai_pipeline(image_path: str):
         "color": "Unknown",
         "brand": "Unknown",
         "coords": [0, 0, 0, 0],
+        "quality_score": 0.0,
         "message": "Unverified object (ignored to prevent false visit)"
     }
 
