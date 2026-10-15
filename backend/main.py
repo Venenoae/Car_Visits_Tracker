@@ -17,7 +17,7 @@ from sqlalchemy import func
 
 from database import engine, Base, get_db, User, Vehicle, Visit
 from auth import verify_password, get_password_hash, create_access_token, get_current_user, init_admin_user
-from ai_pipeline import run_ai_pipeline
+from ai_pipeline import run_ai_pipeline, normalize_plate_number
 
 # Load environment variables
 load_dotenv()
@@ -283,7 +283,7 @@ async def process_capture_background(
             })
             return
     else:
-        plate = ai_results["plate"]
+        plate = normalize_plate_number(ai_results["plate"])
         color = ai_results["color"]
         brand = ai_results["brand"]
 
@@ -316,25 +316,38 @@ async def process_capture_background(
         current_time = datetime.now()
         visit = None
 
-        if direction == "Entry":
-            # 1. If this is a real recognized plate, check if we created an unreadable/provisional visit in the last 45s
-            if not plate.startswith("UNREADABLE-") and not plate.startswith("CAR-"):
-                recent_provisional = db.query(Visit).filter(
-                    Visit.zone == zone,
-                    Visit.status == "Inside",
-                    (Visit.plate_number.like("UNREADABLE-%") | Visit.plate_number.like("CAR-%"))
-                ).order_by(Visit.id.desc()).first()
+        # Helper to check if a newly recognized plate (e.g. 'B 7238') upgrades a recent burst visit
+        # created within the last 45s (either 'UNREADABLE-*' or a partial digit-only read like '7238').
+        if not plate.startswith("UNREADABLE-") and not plate.startswith("CAR-"):
+            recent_inside = db.query(Visit).filter(
+                Visit.zone == zone,
+                Visit.status == "Inside"
+            ).order_by(Visit.id.desc()).all()
+            plate_digits = re.sub(r'\D', '', plate)
+            for r_vis in recent_inside:
+                if not r_vis.entry_timestamp:
+                    continue
+                age_sec = (current_time - r_vis.entry_timestamp).total_seconds()
+                if age_sec > 45.0:
+                    continue
+                r_plate = r_vis.plate_number or ""
+                r_digits = re.sub(r'\D', '', r_plate)
+                is_unreadable = r_plate.startswith("UNREADABLE-") or r_plate.startswith("CAR-")
+                is_partial_upgrade = (
+                    " " in plate and " " not in r_plate and not is_unreadable
+                    and r_digits and plate_digits == r_digits
+                )
+                if is_unreadable or is_partial_upgrade or (r_plate == plate and age_sec < 25.0):
+                    print(f"[AI Burst Upgrade] Consolidating recent burst visit '{r_plate}' ({age_sec:.1f}s ago) -> '{plate}'")
+                    r_vis.plate_number = plate
+                    r_vis.entry_image_url = relative_img_url
+                    visit = r_vis
+                    direction = "Entry"
+                    break
 
-                if recent_provisional:
-                    time_diff = (current_time - recent_provisional.entry_timestamp).total_seconds()
-                    if time_diff < 45:
-                        print(f"[AI Upgrade] Upgrading unreadable visit '{recent_provisional.plate_number}' to recognized plate '{plate}'!")
-                        recent_provisional.plate_number = plate
-                        recent_provisional.entry_image_url = relative_img_url
-                        visit = recent_provisional
-
-            # 2. If this is an unreadable plate, check if an existing unreadable visit was created in the last 30s
-            elif plate.startswith("UNREADABLE-") or plate.startswith("CAR-"):
+        if direction == "Entry" and not visit:
+            # 1. If this is an unreadable plate, check if an existing unreadable visit was created in the last 30s
+            if plate.startswith("UNREADABLE-") or plate.startswith("CAR-"):
                 recent_provisional = db.query(Visit).filter(
                     Visit.zone == zone,
                     Visit.status == "Inside",
@@ -348,7 +361,7 @@ async def process_capture_background(
                         recent_provisional.entry_image_url = relative_img_url
                         visit = recent_provisional
 
-            # 3. Check if vehicle is already marked 'Inside' (In-facility activity suppression)
+            # 2. Check if vehicle is already marked 'Inside' (In-facility activity suppression)
             if not visit:
                 active_visit = db.query(Visit).filter(Visit.plate_number == plate, Visit.status == "Inside").first()
                 if active_visit:
@@ -383,7 +396,7 @@ async def process_capture_background(
                     )
                     db.add(visit)
 
-        else:  # Direction is "Exit"
+        elif direction == "Exit" and not visit:  # Direction is "Exit"
             # Departure Debounce Guard (3-Minute Lockout):
             # Check if this vehicle ALREADY completed an exit in the last 3 minutes (180s)
             recent_completed = db.query(Visit).filter(
@@ -423,10 +436,10 @@ async def process_capture_background(
                     db.close()
                     return
 
-            # 1. Look for exact active 'Inside' match first
+            # 1. Look for exact active 'Inside' match first (must be > 25s old to avoid completing an entry burst!)
             visit = db.query(Visit).filter(Visit.plate_number == plate, Visit.status == "Inside").order_by(Visit.entry_timestamp.desc()).first()
 
-            # 2. Fuzzy match fallback: allow minor OCR variations (e.g. 551913 vs 51913 or 519131)
+            # 2. Fuzzy match fallback: allow minor OCR variations (e.g. 551913 vs 51913 or '7238' vs 'B 7238')
             if not visit:
                 active_inside = db.query(Visit).filter(Visit.status == "Inside").all()
                 best_match = None
@@ -440,10 +453,11 @@ async def process_capture_background(
                     cand_clean = re.sub(r'[^A-Z0-9]', '', cand.plate_number.upper())
                     cand_digits = re.sub(r'\D', '', cand.plate_number)
 
-                    # Check digit containment (e.g. '51913' in '551913' or '519131')
-                    if cand_digits and plate_digits and (cand_digits in plate_digits or plate_digits in cand_digits):
-                        best_match = cand
-                        break
+                    # Check digit containment (e.g. '51913' in '551913' or '7238' in 'B 7238')
+                    if cand_digits and plate_digits and len(cand_digits) >= 3 and len(plate_digits) >= 3:
+                        if cand_digits in plate_digits or plate_digits in cand_digits:
+                            best_match = cand
+                            break
 
                     # Character sequence ratio
                     ratio = SequenceMatcher(None, cand_clean, plate_clean).ratio()
@@ -680,7 +694,7 @@ def update_vehicle_owner_info(
     current_user: User = Depends(get_current_user)
 ):
     """Add/Edit vehicle details and owner info"""
-    plate_cleaned = re.sub(r'[^A-Z0-9]', '', plate_number.upper())
+    plate_cleaned = normalize_plate_number(plate_number)
     vehicle = db.query(Vehicle).filter(Vehicle.plate_number == plate_cleaned).first()
     
     if not vehicle:
@@ -727,7 +741,7 @@ def create_manual_visit(
     if zone not in ["Zone A", "Zone B"] or direction not in ["Entry", "Exit"]:
         raise HTTPException(status_code=400, detail="Invalid parameters")
         
-    plate_cleaned = re.sub(r'[^A-Z0-9]', '', plate_number.upper())
+    plate_cleaned = normalize_plate_number(plate_number)
     
     # Verify vehicle exists, if not auto create
     vehicle = db.query(Vehicle).filter(Vehicle.plate_number == plate_cleaned).first()
@@ -796,7 +810,7 @@ def edit_visit_record(
     
     target_plate = visit.plate_number
     if plate_number is not None:
-        plate_cleaned = re.sub(r'[^A-Z0-9]', '', plate_number.upper())
+        plate_cleaned = normalize_plate_number(plate_number)
         # Ensure vehicle exists
         vehicle = db.query(Vehicle).filter(Vehicle.plate_number == plate_cleaned).first()
         if not vehicle:

@@ -17,29 +17,30 @@ WEB_STREAM_PORT = 8080                          # Port to view live feed in brow
 
 # 🚗 ACTIVE DRIVEWAY CORRIDOR & PARKING MASK (New Camera Position Calibration)
 # Horizontal Corridor:
-# Left limit (x=0.29 / ~370px): Completely masks out the left showroom parking bay
+# Left limit (x=0.28 / ~358px): Completely masks out the left showroom parking bay
 # where the Nissan Patrol is parked so staff walking near it produce ZERO motion triggers!
-# Right limit (x=0.85 / ~1080px): Cuts off far right wall/column.
-DETECTION_X_MIN = 0.25
-DETECTION_X_MAX = 0.95
+# Right limit (x=0.96 / ~1228px): Covers the sliding glass door entrance on the right.
+DETECTION_X_MIN = 0.28
+DETECTION_X_MAX = 0.96
 
 # Vertical Corridor:
-# TOP LIMIT (y=0.18 / ~130px): Cuts off distant highway/street traffic through outer glass.
-# BOTTOM LIMIT (y=0.68 / ~490px): Cuts off indoor showroom walking floor.
-DETECTION_Y_MIN = 0.22
-DETECTION_Y_MAX = 0.68
+# TOP LIMIT (y=0.18 / ~130px): Cuts off distant street traffic through outer glass.
+# BOTTOM LIMIT (y=0.90 / ~648px): Extends down the showroom floor so entering SUVs
+# are NOT clipped at y=490px (which previously inverted centroid dy and mislabeled Entry as Exit!).
+DETECTION_Y_MIN = 0.18
+DETECTION_Y_MAX = 0.90
 
 # Virtual Tripwires calibrated for outside ramp to indoor bay (percentages of frame height)
-# TOP LINE: Outer ramp / glass door sill
-TRIPWIRE_TOP_Y = 0.30
-# BOTTOM LINE: Indoor bay floor where car enters and stops
-TRIPWIRE_BOTTOM_Y = 0.52
+# TOP LINE: Outer ramp / sliding glass door approach
+TRIPWIRE_TOP_Y = 0.34
+# BOTTOM LINE: Indoor bay floor past the white doorway sill (y=430px / 0.60)
+TRIPWIRE_BOTTOM_Y = 0.58
 
-# Contour area and width for vehicles
-MIN_CONTOUR_AREA = 3500
-MIN_VEHICLE_WIDTH = 80
-MIN_CENTROID_DISPLACEMENT = 70  # Vehicle must physically translate >= 70px to trigger
-CAPTURE_COOLDOWN = 1.0          # 1.0s debounce between trigger uploads
+# Contour area and width for real vehicles (rejects upright walking pedestrians)
+MIN_CONTOUR_AREA = 14000
+MIN_VEHICLE_WIDTH = 175
+MIN_CENTROID_DISPLACEMENT = 75  # Vehicle must physically translate >= 75px to trigger
+CAPTURE_COOLDOWN = 1.5          # 1.5s debounce between trigger uploads
 CACHE_MAX_AGE_DAYS = 2          # Discard cached frames older than 2 days to protect SD card storage
 
 # Local cache directory for offline resilience
@@ -335,8 +336,9 @@ def main():
     last_status_msg = "Ready - Monitoring Gate"
 
     # Centroid trajectory and close-zone best-plate buffer
-    trajectory = []  # List of (timestamp, cx, cy, area, bw, bh)
+    trajectory = []  # List of (timestamp, cx, cy, area, bw, bh, y_bottom_edge)
     best_vehicle_frame = None
+    best_frame_quality = 0.0
     max_tracked_area = 0
     prev_cy = None
 
@@ -368,12 +370,14 @@ def main():
 
         # 1. Driveway Spatial Masking:
         # Zero out the left showroom parking bay (where the Nissan Patrol sits and staff walk),
-        # the right wall/column, the distant street, and the foreground indoor floor.
+        # the upper-left fixed glass wall & black structural pillar (x < 0.58*w, y < 0.57*h)
+        # where cars cannot physically pass, the right wall/column, and the distant street.
         motion_frame = frame.copy()
         motion_frame[:y_roi_min, :] = 0
         motion_frame[y_roi_max:, :] = 0
         motion_frame[:, :x_lane_min] = 0
         motion_frame[:, x_lane_max:] = 0
+        motion_frame[:int(h * 0.57), :int(w * 0.58)] = 0
 
         # 2. Background Subtraction focused exclusively on active sliding-door driveway
         fg_mask = back_sub.apply(motion_frame)
@@ -408,16 +412,16 @@ def main():
         bot_color = (0, 255, 0) if (current_time - bottom_cross_down_time < 1.5 or current_time - bottom_cross_up_time < 1.5) else (0, 200, 100)
 
         cv2.line(display_frame, (x_lane_min, y_top), (x_lane_max, y_top), top_color, 2)
-        cv2.putText(display_frame, f"TRIPWIRE TOP (Ramp / Street) [{int(TRIPWIRE_TOP_Y*100)}%]", (x_lane_min + 10, y_top - 6),
+        cv2.putText(display_frame, f"TRIPWIRE TOP (Ramp / Doorway) [{int(TRIPWIRE_TOP_Y*100)}%]", (x_lane_min + 10, y_top - 6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, top_color, 2)
 
         cv2.line(display_frame, (x_lane_min, y_bottom), (x_lane_max, y_bottom), bot_color, 2)
-        cv2.putText(display_frame, f"TRIPWIRE BOTTOM (Gate Threshold) [{int(TRIPWIRE_BOTTOM_Y*100)}%]", (x_lane_min + 10, y_bottom - 6),
+        cv2.putText(display_frame, f"TRIPWIRE BOTTOM (Gate Sill) [{int(TRIPWIRE_BOTTOM_Y*100)}%]", (x_lane_min + 10, y_bottom - 6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, bot_color, 2)
 
         # Masked Floor Indicator
         cv2.line(display_frame, (x_lane_min, y_roi_max), (x_lane_max, y_roi_max), (100, 100, 100), 1)
-        cv2.putText(display_frame, "[INDOOR FLOOR MASKED OUT - PEDESTRIANS IGNORED]", (x_lane_min + 10, y_roi_max + 20),
+        cv2.putText(display_frame, "[LOWER EDGE OF GATE TRACKING ZONE]", (x_lane_min + 10, min(h - 10, y_roi_max + 20)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (140, 140, 140), 1)
 
         largest_area_this_frame = 0
@@ -431,14 +435,16 @@ def main():
             x, y, bw, bh = cv2.boundingRect(contour)
 
             # Ignore contours spanning outside the active driveway corridor
-            if (y + bh) > (y_roi_max + 20) or y < (y_roi_min - 20):
+            if (y + bh) > (y_roi_max + 25) or y < (y_roi_min - 20):
                 continue
             if (x + bw) > (x_lane_max + 20) or x < (x_lane_min - 20):
                 continue
 
-            # Pedestrian filter: narrow upright contours
+            # Strict Pedestrian & Floor Reflection Filter:
+            # Staff walking in the showroom have bw=90..205px, bh=240..420px (aspect_ratio=0.33..0.70).
+            # Real vehicles entering/exiting the sliding door have bw >= 220px or aspect_ratio >= 0.72 with large area.
             aspect_ratio = bw / float(bh) if bh > 0 else 0
-            if aspect_ratio < 0.55 and bw < 70:
+            if (aspect_ratio < 0.72 and bw < 210 and area < 42000) or (bw < MIN_VEHICLE_WIDTH and area < 22000):
                 cv2.rectangle(display_frame, (x, y), (x + bw, y + bh), (120, 120, 120), 1)
                 continue
 
@@ -459,14 +465,15 @@ def main():
             x, y, bw, bh = vehicle_box
             cx = x + (bw // 2)
             cy = y + (bh // 2)
+            y_bot_edge = y + bh
 
             # Spatial Continuity Check:
-            # If the detected centroid suddenly jumps > 90px from the previous point,
-            # it is a different physical object (e.g. staff walking in showroom vs car entering from ramp)!
+            # If the detected centroid suddenly jumps > 130px from the previous point,
+            # it is a different physical object!
             if len(trajectory) > 0:
-                last_time, last_cx, last_cy, _, _, _ = trajectory[-1]
+                last_time, last_cx, last_cy, _, _, _, _ = trajectory[-1]
                 dist = ((cx - last_cx)**2 + (cy - last_cy)**2) ** 0.5
-                if dist > 90 and (current_time - last_time) < 0.5:
+                if dist > 130 and (current_time - last_time) < 0.5:
                     trajectory = []
                     prev_cy = None
                     top_cross_down_time = 0
@@ -474,27 +481,29 @@ def main():
                     bottom_cross_up_time = 0
                     top_cross_up_time = 0
 
-            trajectory.append((current_time, cx, cy, largest_area_this_frame, bw, bh))
+            trajectory.append((current_time, cx, cy, largest_area_this_frame, bw, bh, y_bot_edge))
 
-            # Centroid tripwire crossings (precise point-crossing avoids multi-line overlap)
+            # Centroid tripwire crossings
             if prev_cy is not None:
-                # Downward crossing across Top line
                 if prev_cy < y_top <= cy:
                     top_cross_down_time = current_time
-                # Downward crossing across Bottom line
                 if prev_cy < y_bottom <= cy:
                     bottom_cross_down_time = current_time
-                # Upward crossing across Bottom line
                 if prev_cy > y_bottom >= cy:
                     bottom_cross_up_time = current_time
-                # Upward crossing across Top line
                 if prev_cy > y_top >= cy:
                     top_cross_up_time = current_time
 
             prev_cy = cy
 
-            # Buffer clearest frame when vehicle has maximum clear size in outside zone
-            if largest_area_this_frame > max_tracked_area:
+            # Buffer clearest & sharpest frame when vehicle is well inside the doorway visibility zone
+            v_crop_gray = cv2.cvtColor(frame[max(0, y):min(h, y + bh), max(0, x):min(w, x + bw)], cv2.COLOR_BGR2GRAY)
+            sharpness = cv2.Laplacian(v_crop_gray, cv2.CV_64F).var() if v_crop_gray.size > 0 else 1.0
+            centering_weight = 1.35 if (int(h * 0.52) <= y_bot_edge <= int(h * 0.88)) else 1.0
+            frame_quality = largest_area_this_frame * (min(max(sharpness, 15.0), 400.0) ** 0.35) * centering_weight
+
+            if frame_quality > best_frame_quality:
+                best_frame_quality = frame_quality
                 max_tracked_area = largest_area_this_frame
                 best_vehicle_frame = frame.copy()
 
@@ -503,8 +512,8 @@ def main():
         else:
             prev_cy = None
 
-        # Prune trajectory to last 3.0 seconds
-        trajectory = [t for t in trajectory if (current_time - t[0]) < 3.0]
+        # Prune trajectory to last 3.5 seconds
+        trajectory = [t for t in trajectory if (current_time - t[0]) < 3.5]
 
         # Draw trajectory history on preview
         if len(trajectory) > 1:
@@ -516,28 +525,22 @@ def main():
         # Determine Motion Direction
         direction = None
 
-        # Check trajectory origin if available
         start_cy = trajectory[0][2] if len(trajectory) > 0 else None
         start_cx = trajectory[0][1] if len(trajectory) > 0 else None
-        latest_bw = vehicle_box[2] if vehicle_box is not None else 0
 
         # 1. Centroid Sequential Tripwires
-        # Top -> Down crossing within 0.3s - 3.5s = ENTRY
-        # Strictest requirement: Entry MUST originate from outside the ramp (start_cy <= y_top + 25)
-        # and vehicle must have substantial width (>= 130px)
         if top_cross_down_time > 0 and bottom_cross_down_time > 0:
             if top_cross_down_time < bottom_cross_down_time and (bottom_cross_down_time - top_cross_down_time) < 3.5:
-                if start_cy is None or start_cy <= (y_top + 25):
+                if start_cy is None or start_cy <= (y_top + 45):
                     direction = "Entry"
                     last_status_msg = "Top-to-Bottom Ramp Crossing -> ENTRY (Check-In)"
                 else:
                     last_status_msg = "Indoor Motion Ignored (Did not originate from outside ramp)"
                 top_cross_down_time = 0
                 bottom_cross_down_time = 0
-        # Bottom -> Top crossing within 0.3s - 3.5s = EXIT
         elif bottom_cross_up_time > 0 and top_cross_up_time > 0:
             if bottom_cross_up_time < top_cross_up_time and (top_cross_up_time - bottom_cross_up_time) < 3.5:
-                if start_cy is None or start_cy >= (y_bottom - 25):
+                if start_cy is None or start_cy >= (y_bottom - 45):
                     direction = "Exit"
                     last_status_msg = "Bottom-to-Top Ramp Crossing -> EXIT (Check-Out)"
                 else:
@@ -545,44 +548,46 @@ def main():
                 bottom_cross_up_time = 0
                 top_cross_up_time = 0
 
-        # 2. Continuous 2D Motion Vector + Perspective Scale Factor (Fallback / Real-Time)
-        if direction is None and len(trajectory) >= 6:
+        # 2. Continuous 2D Motion Vector + Lower Bumper Advancement + Scale Factor
+        if direction is None and len(trajectory) >= 5:
             dt = trajectory[-1][0] - trajectory[0][0]
-            if dt >= 0.28:
-                # Compare average of first 3 points vs last 3 points for smooth vector
-                start_pts = trajectory[:3]
-                end_pts = trajectory[-3:]
+            if dt >= 0.25:
+                start_pts = trajectory[:2]
+                end_pts = trajectory[-2:]
 
                 s_cx = sum(p[1] for p in start_pts) / len(start_pts)
                 s_cy = sum(p[2] for p in start_pts) / len(start_pts)
                 s_area = sum(p[3] for p in start_pts) / len(start_pts)
+                s_ybot = sum(p[6] for p in start_pts) / len(start_pts)
 
                 end_cx = sum(p[1] for p in end_pts) / len(end_pts)
                 end_cy = sum(p[2] for p in end_pts) / len(end_pts)
                 end_area = sum(p[3] for p in end_pts) / len(end_pts)
+                end_ybot = sum(p[6] for p in end_pts) / len(end_pts)
 
                 dx = end_cx - s_cx
                 dy = end_cy - s_cy
+                dy_bot = end_ybot - s_ybot
                 area_ratio = end_area / max(s_area, 1.0)
 
-                # Filter out horizontal street cross-traffic
-                if abs(dx) > (abs(dy) * 1.3) and abs(dx) > 40:
+                # Filter out pure horizontal outside street traffic (high up in frame y < y_top)
+                if abs(dx) > (abs(dy) * 1.8) and end_ybot < y_bottom:
                     last_status_msg = "Street Cross Traffic Ignored (Horizontal)"
                 else:
-                    # Vertical motion down ramp / driveway
-                    if dy > 30 and (s_cy <= y_top + 25):
-                        # Moving Top -> Down (Approaching from outside)
+                    # ENTRY: Vehicle moves downward into showroom (dy > 25 or dy_bot > 35)
+                    # and approaches from the right-side sliding door (dx <= 20)
+                    if (dy > 25 or dy_bot > 40) and dx <= 25 and (s_cy <= y_bottom + 20):
                         current_direction_hint = "Entry"
-                        if (top_cross_down_time > 0) or (area_ratio >= 1.05 and end_cy >= (y_bottom - 20)):
+                        if (top_cross_down_time > 0) or (bottom_cross_down_time > 0) or (end_ybot >= y_bottom + 30 and area_ratio >= 1.05):
                             direction = "Entry"
-                            last_status_msg = f"Ramp Inward Vector (dy=+{int(dy)}px, scale={area_ratio:.2f}) -> ENTRY"
+                            last_status_msg = f"Ramp Inward Vector (dy=+{int(dy)}px, dy_bot=+{int(dy_bot)}px, scale={area_ratio:.2f}) -> ENTRY"
 
-                    elif dy < -30 and (s_cy >= y_bottom - 25):
-                        # Moving Down -> Top (Leaving from inside bay)
+                    # EXIT: Vehicle moves upward toward the sliding door (dy < -25 and dy_bot < -20)
+                    elif dy < -25 and dy_bot < -15 and (s_ybot >= y_bottom - 10):
                         current_direction_hint = "Exit"
-                        if (bottom_cross_up_time > 0) or (area_ratio <= 0.95 and end_cy <= (y_top + 20)):
+                        if (bottom_cross_up_time > 0) or (top_cross_up_time > 0) or (area_ratio <= 0.95 and end_cy <= (y_top + 35)):
                             direction = "Exit"
-                            last_status_msg = f"Ramp Outward Vector (dy={int(dy)}px, scale={area_ratio:.2f}) -> EXIT"
+                            last_status_msg = f"Ramp Outward Vector (dy={int(dy)}px, dy_bot={int(dy_bot)}px, scale={area_ratio:.2f}) -> EXIT"
 
         # Draw Real-time Direction Arrow HUD on Preview
         if current_direction_hint == "Entry" or direction == "Entry":
@@ -594,11 +599,12 @@ def main():
 
         # Trigger snapshot upload if cooldown has passed and vehicle physically moved
         if direction:
-            # Centroid Displacement Validation: ensure vehicle moved >= MIN_CENTROID_DISPLACEMENT
-            # Rejects stationary showroom cars with staff walking past them!
+            # 2D Displacement Validation: ensure vehicle translated >= MIN_CENTROID_DISPLACEMENT
             total_disp = 0
             if len(trajectory) >= 2:
-                total_disp = abs(trajectory[-1][2] - trajectory[0][2])
+                dx_tot = trajectory[-1][1] - trajectory[0][1]
+                dy_tot = trajectory[-1][2] - trajectory[0][2]
+                total_disp = (dx_tot**2 + dy_tot**2) ** 0.5
 
             if total_disp < MIN_CENTROID_DISPLACEMENT and len(trajectory) >= 4:
                 direction = None
@@ -614,7 +620,7 @@ def main():
                 filename = f"{ZONE.replace(' ', '')}_{direction}_{timestamp}.jpg"
                 save_path = os.path.join(CACHE_DIR, filename)
 
-                # Save the highest-resolution buffered frame (vehicle closest to camera)
+                # Save the highest-resolution & sharpest buffered frame
                 upload_frame = best_vehicle_frame if best_vehicle_frame is not None else frame
                 cv2.imwrite(save_path, upload_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
                 print(f"[Event] Best snapshot saved: {filename} (Area: {max_tracked_area})")
@@ -623,6 +629,7 @@ def main():
             # Reset trajectory and buffer after event
             trajectory = []
             best_vehicle_frame = None
+            best_frame_quality = 0.0
             max_tracked_area = 0
             top_cross_down_time = 0
             bottom_cross_down_time = 0
