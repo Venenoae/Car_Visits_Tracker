@@ -114,6 +114,7 @@ def extract_license_plate(vehicle_img) -> str:
         return "UNKNOWN"
 
     candidates = []
+    category_prefixes = []
     vh, vw = vehicle_img.shape[:2]
 
     # Sample lower bumper area (where plates are mounted)
@@ -127,7 +128,7 @@ def extract_license_plate(vehicle_img) -> str:
         ("clahe", cv2.createCLAHE(clipLimit=3.5, tileGridSize=(8, 8)).apply(cv2.resize(gray, (0, 0), fx=2.0, fy=2.0))),
         ("bilateral", cv2.createCLAHE(clipLimit=3.5, tileGridSize=(8, 8)).apply(cv2.bilateralFilter(cv2.resize(gray, (0, 0), fx=2.0, fy=2.0), 9, 75, 75))),
     ]
-    
+
     for pass_name, proc_img in passes:
         ocr_res = ocr_reader.readtext(proc_img)
         if not ocr_res:
@@ -148,7 +149,12 @@ def extract_license_plate(vehicle_img) -> str:
             cy = (by1 + by2) / 2.0
             h = abs(by2 - by1)
             w = abs(bx2 - bx1)
-            boxes.append({'text': text.strip(), 'cx': cx, 'cy': cy, 'h': h, 'w': w, 'box': [bx1, by1, bx2, by2], 'conf': conf})
+            clean_t = text.strip()
+            boxes.append({'text': clean_t, 'cx': cx, 'cy': cy, 'h': h, 'w': w, 'box': [bx1, by1, bx2, by2], 'conf': conf})
+
+            # Detect standalone Abu Dhabi / UAE category badges (1-20, 50)
+            if clean_t.isdigit() and int(clean_t) in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17, 50]:
+                category_prefixes.append((clean_t, conf, [bx1, by1, bx2, by2]))
 
         # Horizontal clustering (group boxes with similar Y on the same horizontal line)
         clusters = []
@@ -179,9 +185,7 @@ def extract_license_plate(vehicle_img) -> str:
             if plate_str:
                 candidates.append((plate_str, b['conf'] + bonus, [b]))
 
-    # Prefix expansion check:
-    # If best candidate is a plain numeric plate (e.g. '55456' without category),
-    # expand the crop to the left in the bumper to catch the Abu Dhabi / Dubai category prefix!
+    # Cross-reference candidates and expand prefixes:
     final_candidates = []
     for plate_str, score, cl in candidates:
         if " " not in plate_str and plate_str.isdigit():
@@ -192,6 +196,22 @@ def extract_license_plate(vehicle_img) -> str:
             bw = max_x - min_x
             bh = max_y - min_y
 
+            # 1. Match with any category prefix found to the left on the same baseline
+            found_cat = None
+            for cat_num, cat_conf, cat_box in category_prefixes:
+                if cat_box[2] <= min_x + bw * 0.25 and (min_x - cat_box[0]) < bw * 1.5:
+                    cat_cy = (cat_box[1] + cat_box[3]) / 2.0
+                    digit_cy = (min_y + max_y) / 2.0
+                    if abs(cat_cy - digit_cy) < max(bh, cat_box[3] - cat_box[1]) * 1.2:
+                        found_cat = cat_num
+                        break
+
+            if found_cat:
+                combined_plate = f"{found_cat} {plate_str}"
+                final_candidates.append((combined_plate, score + 4.0))
+                continue
+
+            # 2. Check prefix crop to the left with bilateral/CLAHE filter
             ex_x1 = max(0, int(min_x - bw * 1.3))
             ex_x2 = min(bumper_crop.shape[1], int(max_x + bw * 0.2))
             ex_y1 = max(0, int(min_y - bh * 0.3))
@@ -199,7 +219,11 @@ def extract_license_plate(vehicle_img) -> str:
 
             expanded_sub = bumper_crop[ex_y1:ex_y2, ex_x1:ex_x2]
             if expanded_sub.size > 0:
-                sub_res = ocr_reader.readtext(expanded_sub)
+                sub_gray = cv2.cvtColor(expanded_sub, cv2.COLOR_BGR2GRAY)
+                sub_proc = cv2.createCLAHE(clipLimit=3.5, tileGridSize=(8, 8)).apply(
+                    cv2.bilateralFilter(cv2.resize(sub_gray, (0, 0), fx=2.0, fy=2.0), 9, 75, 75)
+                )
+                sub_res = ocr_reader.readtext(sub_proc)
                 sub_items = []
                 for s_bbox, s_text, s_conf in sub_res:
                     s_cx = (s_bbox[0][0] + s_bbox[1][0]) / 2.0
@@ -208,8 +232,26 @@ def extract_license_plate(vehicle_img) -> str:
                 expanded_joined = " ".join(x[1] for x in sub_items)
                 exp_plate, exp_bonus = clean_plate_candidate(expanded_joined)
                 if exp_plate and " " in exp_plate:
-                    final_candidates.append((exp_plate, score + 3.0))
+                    cat_prefix = exp_plate.split()[0]
+                    # Retain full plate_str digits
+                    combined_plate = f"{cat_prefix} {plate_str}"
+                    final_candidates.append((combined_plate, score + 3.0))
                     continue
+
+        elif " " in plate_str:
+            parts = plate_str.split()
+            cat = parts[0]
+            short_digits = parts[1]
+            # See if another candidate has longer digits that encompass short_digits
+            for other_str, other_score, _ in candidates:
+                if " " not in other_str and other_str.isdigit() and len(other_str) > len(short_digits):
+                    if short_digits[0] == other_str[0] and short_digits[-1] == other_str[-1]:
+                        plate_str = f"{cat} {other_str}"
+                        score += 3.0
+                        break
+            final_candidates.append((plate_str, score))
+            continue
+
         final_candidates.append((plate_str, score))
 
     if final_candidates:
@@ -261,15 +303,23 @@ def classify_color(vehicle_img) -> str:
         "Green": 0, "Yellow": 0
     }
 
+    # Distinct check for White paint: low saturation with bright specular highlights
+    s_vals = pixels[:, 1]
+    v_vals = pixels[:, 2]
+    low_sat_mask = (s_vals < 40) & (v_vals > 40)
+    if np.sum(low_sat_mask) > len(pixels) * 0.40:
+        low_sat_v = v_vals[low_sat_mask]
+        if np.mean(low_sat_v > 185) > 0.15 and np.median(low_sat_v) > 125:
+            return "White"
+
     for h_val, s, v in pixels:
-        # Exclude extreme specular glare and pitch-black underbody shadow crevices
-        if v < 30 or (v > 245 and s < 15):
+        if v < 30:
             continue
 
-        if s < 45:  # Low saturation: Black / Silver/Grey / White
-            if v > 165:
+        if s < 40:  # Low saturation: Black / Silver/Grey / White
+            if v > 155:
                 color_counts["White"] += 1
-            elif v < 65:
+            elif v < 60:
                 color_counts["Black"] += 1
             else:
                 color_counts["Silver/Grey"] += 1
